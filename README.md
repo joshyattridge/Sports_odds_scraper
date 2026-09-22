@@ -39,6 +39,34 @@ pip install -r requirements.txt
 echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env
 ```
 
+### AI-driven live monitor
+
+The live monitor uses OpenAI `gpt-5.6-luna` once at startup to analyze the
+rendered page and create a data-only extraction plan. It validates that plan
+against the page before polling, then uses the validated plan locally so the
+model is not called for every odds tick.
+
+```bash
+export OPENAI_API_KEY="your_api_key_here"
+python3 test_live_scraper.py \
+  "https://www.pinnacle.com/en/tennis/matchups/live/" \
+  --market moneyline
+```
+
+Odds are printed initially and again only when a player's price changes.
+
+For a fully model-generated page-specific extractor, use:
+
+```bash
+python3 test_live_scraper.py \
+  "https://www.pinnacle.com/en/tennis/matchups/live/" \
+  --market moneyline
+```
+
+This writes the validated generated module to `generated_scraper.py`. If
+generation, compilation, or extraction validation fails, the error is sent
+back to GPT-5.6 Luna for another attempt, up to five attempts.
+
 ## Usage
 
 ### Step 1: Setup (one-time)

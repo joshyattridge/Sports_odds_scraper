@@ -38,6 +38,7 @@ ENV/
 # Logs
 *.log
 odds_log.csv
+generated_scraper.py
 
 # Rules (learned patterns - regenerated per URL)
 rules/
