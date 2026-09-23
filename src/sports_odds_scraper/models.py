@@ -8,6 +8,7 @@ from typing import Tuple
 class Selection:
     name: str
     odds: float
+    formatted_odds: str
 
 
 @dataclass(frozen=True)

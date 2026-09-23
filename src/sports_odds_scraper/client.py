@@ -9,6 +9,7 @@ import logging
 import re
 import sys
 from datetime import datetime, timezone
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable
 
@@ -20,6 +21,11 @@ from .models import OddsEvent, Selection
 MODEL = "gpt-5.6-luna"
 GENERATED = Path("generated_scraper.py")
 ALLOWED_IMPORTS = {"re", "json", "html", "decimal", "typing", "dataclasses"}
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 logger = logging.getLogger(__name__)
 
 
@@ -44,6 +50,39 @@ def safe_code(code: str) -> tuple[bool, str]:
         if forbidden:
             return False, f"forbidden imports: {forbidden}"
     return True, "ok"
+
+
+def normalise_rows(rows: object) -> object:
+    """Convert decimal or fractional model output to canonical decimal strings."""
+    if not isinstance(rows, list):
+        return rows
+    normalised = []
+    for row in rows:
+        if not isinstance(row, dict):
+            normalised.append(row)
+            continue
+        copied = dict(row)
+        selections = []
+        for selection in row.get("selections", []):
+            item = dict(selection)
+            value = str(item.get("odds", "")).strip()
+            if re.fullmatch(r"\d+(?:\.\d+)?/\d+(?:\.\d+)?", value):
+                numerator, denominator = value.split("/")
+                # Decimal odds = fractional odds + 1.
+                item["odds"] = str(float(Fraction(numerator) / Fraction(denominator) + 1))
+            else:
+                item["odds"] = value
+            selections.append(item)
+        copied["selections"] = selections
+        normalised.append(copied)
+    return normalised
+
+
+def format_odds(decimal_odds: float, odds_format: str) -> str:
+    if odds_format == "decimal":
+        return f"{decimal_odds:.3f}"
+    fraction = Fraction(decimal_odds - 1).limit_denominator(1000)
+    return f"{fraction.numerator}/{fraction.denominator}"
 
 
 def validate_rows(rows: object, market: str) -> tuple[bool, str]:
@@ -112,7 +151,8 @@ It receives rendered body text from the page and must return:
 
 Rules:
 - Return only the requested market, not handicap, totals, maps, sets, or games.
-- Return decimal odds as strings greater than 1.
+- Return all odds as decimal strings greater than 1. Convert fractional odds
+  such as 5/2 to decimal odds such as 3.500.
 - Use only the supplied snapshot; do not make network calls.
 - Use standard-library imports only.
 - Include no CLI, infinite loop, file writes, subprocesses, or explanation.
@@ -153,7 +193,7 @@ def discover(api_key: str, url: str, market: str, page, retries: int) -> tuple[P
         GENERATED.write_text(code)
         try:
             extract = load_extract(GENERATED)
-            rows = extract(snapshot)
+            rows = normalise_rows(extract(snapshot))
             ok, feedback = validate_rows(rows, market)
             if ok:
                 logger.info("Local validation passed: %s", feedback)
@@ -174,13 +214,19 @@ def run(
     market: str,
     on_change: Callable[[OddsEvent], None],
     retries: int = 5,
-    wait: float = 10.0,
+    wait: float = 30.0,
+    odds_format: str = "decimal",
 ) -> int:
     if not api_key:
         raise ValueError("api_key is required")
+    if odds_format not in {"decimal", "fraction"}:
+        raise ValueError("odds_format must be 'decimal' or 'fraction'")
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": 1920, "height": 1080})
+        page = browser.new_page(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=DEFAULT_USER_AGENT,
+        )
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=45_000)
             page.wait_for_timeout(int(wait * 1000))
@@ -190,7 +236,7 @@ def run(
             def process_snapshot(body: str) -> None:
                 nonlocal previous
                 try:
-                    rows = extract(body)
+                    rows = normalise_rows(extract(body))
                 except Exception as exc:
                     logger.warning("Skipped snapshot: generated scraper error: %s", exc)
                     return
@@ -204,7 +250,14 @@ def run(
                         if previous.get(event) != values:
                             on_change(OddsEvent(
                                 event=event,
-                                selections=tuple(Selection(name=n, odds=float(o)) for n, o in values),
+                                selections=tuple(
+                                    Selection(
+                                        name=n,
+                                        odds=float(o),
+                                        formatted_odds=format_odds(float(o), odds_format),
+                                    )
+                                    for n, o in values
+                                ),
                             ))
                     previous = current
                 else:
@@ -252,15 +305,18 @@ class OddsMonitor:
         api_key: OpenAI API key used for scraper generation and auditing.
     """
 
-    def __init__(self, url: str, market: str, api_key: str, *, retries: int = 5, wait: float = 10.0):
+    def __init__(self, url: str, market: str, api_key: str, *, odds_format: str = "decimal", retries: int = 5, wait: float = 30.0):
         if not api_key:
             raise ValueError("api_key is required")
         self.url = url
         self.market = market
         self.api_key = api_key
+        if odds_format not in {"decimal", "fraction"}:
+            raise ValueError("odds_format must be 'decimal' or 'fraction'")
+        self.odds_format = odds_format
         self.retries = retries
         self.wait = wait
 
     def run(self, on_change: Callable[[OddsEvent], None]) -> int:
         """Start monitoring and call ``on_change`` for new or changed events."""
-        return run(self.api_key, self.url, self.market, on_change, self.retries, self.wait)
+        return run(self.api_key, self.url, self.market, on_change, self.retries, self.wait, self.odds_format)

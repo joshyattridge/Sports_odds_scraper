@@ -58,6 +58,7 @@ monitor = OddsMonitor(
     url="https://www.pinnacle.com/en/tennis/matchups/live/",
     market="moneyline",
     api_key="your-openai-api-key",
+    odds_format="decimal",  # or "fraction"
 )
 
 monitor.run(on_change=handle_odds)
@@ -78,6 +79,16 @@ python test_live_scraper.py \
 
 The local runner supplies a printing callback so the package can be tested
 directly from a terminal.
+
+Use fractional output when needed:
+
+```bash
+python test_live_scraper.py URL --market moneyline --odds-format fraction
+```
+
+Internally, all odds are normalized to decimal values. Fractional inputs are
+converted using `decimal = fractional + 1`; callbacks receive both numeric
+`selection.odds` and formatted `selection.formatted_odds` values.
 
 ## Package layout
 
