@@ -2,8 +2,15 @@
 
 import argparse
 import os
+from datetime import datetime, timezone
 
-from live_scraper import run
+from sports_odds_scraper import OddsMonitor, OddsEvent
+
+
+def print_change(change: OddsEvent) -> None:
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    prices = " | ".join(f"{selection.name}: {selection.odds:g}" for selection in change.selections)
+    print(f"{stamp} | {change.event} | {prices}", flush=True)
 
 
 def main() -> int:
@@ -15,7 +22,14 @@ def main() -> int:
     args = parser.parse_args()
     if not os.getenv("OPENAI_API_KEY"):
         parser.error("OPENAI_API_KEY is required")
-    return run(args.url, args.market, args.retries, args.wait)
+    scraper = OddsMonitor(
+        args.url,
+        market=args.market,
+        api_key=os.environ["OPENAI_API_KEY"],
+        retries=args.retries,
+        wait=args.wait,
+    )
+    return scraper.run(on_change=print_change)
 
 
 if __name__ == "__main__":

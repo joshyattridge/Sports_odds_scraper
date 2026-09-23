@@ -5,16 +5,22 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import logging
 import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from playwright.sync_api import sync_playwright
+
+from .exceptions import ScraperGenerationError
+from .models import OddsEvent, Selection
 
 MODEL = "gpt-5.6-luna"
 GENERATED = Path("generated_scraper.py")
 ALLOWED_IMPORTS = {"re", "json", "html", "decimal", "typing", "dataclasses"}
+logger = logging.getLogger(__name__)
 
 
 def clean_code(text: str) -> str:
@@ -60,7 +66,7 @@ def validate_rows(rows: object, market: str) -> tuple[bool, str]:
     return True, f"{len(rows)} valid event(s) for {market}"
 
 
-def audit_completeness(url: str, market: str, snapshot: str, rows: object) -> tuple[bool, str]:
+def audit_completeness(api_key: str, url: str, market: str, snapshot: str, rows: object) -> tuple[bool, str]:
     """Use a separate model pass to check completeness and exact prices."""
     from openai import OpenAI
 
@@ -80,7 +86,7 @@ wrong, or another market (maps, sets, handicap, totals) was included.
 
 COMPLETE RENDERED PAGE:
 {snapshot[:90000]}"""
-    response = OpenAI().responses.create(model=MODEL, input=prompt)
+    response = OpenAI(api_key=api_key).responses.create(model=MODEL, input=prompt)
     try:
         result = json.loads(clean_code(response.output_text))
     except (json.JSONDecodeError, TypeError) as exc:
@@ -90,10 +96,10 @@ COMPLETE RENDERED PAGE:
     return True, "complete-page audit passed"
 
 
-def generate(url: str, market: str, snapshot: str, feedback: str = "") -> str:
+def generate(api_key: str, url: str, market: str, snapshot: str, feedback: str = "") -> str:
     from openai import OpenAI
 
-    client = OpenAI()
+    client = OpenAI(api_key=api_key)
     prompt = f"""Write a complete Python scraper module for this URL and market.
 URL: {url}
 TARGET MARKET: {market}
@@ -133,16 +139,16 @@ def load_extract(path: Path):
     return module.extract
 
 
-def discover(url: str, market: str, page, retries: int) -> tuple[Path, object]:
+def discover(api_key: str, url: str, market: str, page, retries: int) -> tuple[Path, object]:
     snapshot = page.locator("body").inner_text()
     feedback = ""
     for attempt in range(1, retries + 1):
-        print(f"Generating scraper with {MODEL} (attempt {attempt}/{retries})...", flush=True)
-        code = generate(url, market, snapshot, feedback)
-        print(f"{MODEL} returned generated scraper code ({len(code)} characters). Validating...", flush=True)
+        logger.info("Generating scraper with %s (attempt %d/%d)", MODEL, attempt, retries)
+        code = generate(api_key, url, market, snapshot, feedback)
+        logger.info("%s returned generated scraper code (%d characters). Validating", MODEL, len(code))
         ok, feedback = safe_code(code)
         if not ok:
-            print(f"Generated code rejected: {feedback}", file=sys.stderr, flush=True)
+            logger.warning("Generated code rejected: %s", feedback)
             continue
         GENERATED.write_text(code)
         try:
@@ -150,26 +156,35 @@ def discover(url: str, market: str, page, retries: int) -> tuple[Path, object]:
             rows = extract(snapshot)
             ok, feedback = validate_rows(rows, market)
             if ok:
-                print(f"Local validation passed: {feedback}", file=sys.stderr, flush=True)
-                ok, audit_feedback = audit_completeness(url, market, snapshot, rows)
+                logger.info("Local validation passed: %s", feedback)
+                ok, audit_feedback = audit_completeness(api_key, url, market, snapshot, rows)
                 if ok:
-                    print(f"Generated scraper validated on attempt {attempt}: {audit_feedback}", file=sys.stderr, flush=True)
+                    logger.info("Generated scraper validated on attempt %d: %s", attempt, audit_feedback)
                     return GENERATED, extract
                 feedback = audit_feedback
         except Exception as exc:
             feedback = f"generated scraper raised {type(exc).__name__}: {exc}"
-        print(f"Generated scraper attempt {attempt} failed: {feedback}", file=sys.stderr, flush=True)
-    raise RuntimeError(f"GPT could not generate a validated scraper: {feedback}")
+        logger.warning("Generated scraper attempt %d failed: %s", attempt, feedback)
+    raise ScraperGenerationError(f"GPT could not generate a validated scraper: {feedback}")
 
 
-def run(url: str, market: str, retries: int, wait: float = 10.0) -> int:
+def run(
+    api_key: str,
+    url: str,
+    market: str,
+    on_change: Callable[[OddsEvent], None],
+    retries: int = 5,
+    wait: float = 10.0,
+) -> int:
+    if not api_key:
+        raise ValueError("api_key is required")
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1920, "height": 1080})
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=45_000)
             page.wait_for_timeout(int(wait * 1000))
-            _, extract = discover(url, market, page, retries)
+            _, extract = discover(api_key, url, market, page, retries)
             previous: dict[str, object] = {}
 
             def process_snapshot(body: str) -> None:
@@ -177,7 +192,7 @@ def run(url: str, market: str, retries: int, wait: float = 10.0) -> int:
                 try:
                     rows = extract(body)
                 except Exception as exc:
-                    print(f"Skipped snapshot: generated scraper error: {exc}", file=sys.stderr, flush=True)
+                    logger.warning("Skipped snapshot: generated scraper error: %s", exc)
                     return
                 ok, message = validate_rows(rows, market)
                 if ok:
@@ -187,11 +202,13 @@ def run(url: str, market: str, retries: int, wait: float = 10.0) -> int:
                         values = tuple((str(s["name"]), str(s["odds"])) for s in row["selections"])
                         current[event] = values
                         if previous.get(event) != values:
-                            stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                            print(f"{stamp} | {event} | " + " | ".join(f"{n}: {o}" for n, o in values), flush=True)
+                            on_change(OddsEvent(
+                                event=event,
+                                selections=tuple(Selection(name=n, odds=float(o)) for n, o in values),
+                            ))
                     previous = current
                 else:
-                    print(f"Skipped invalid snapshot: {message}", file=sys.stderr)
+                    logger.warning("Skipped invalid snapshot: %s", message)
 
             # Pinnacle updates its React UI from live streams. Observe the
             # rendered DOM and debounce bursts of mutations into one scrape.
@@ -217,10 +234,33 @@ def run(url: str, market: str, retries: int, wait: float = 10.0) -> int:
                 }
             """)
             process_snapshot(page.locator("body").inner_text())
-            print("Watching for live page changes (event-driven)...", file=sys.stderr, flush=True)
+            logger.info("Watching for live page changes (event-driven)")
             while True:
                 page.wait_for_timeout(1000)
         except KeyboardInterrupt:
             return 0
         finally:
             browser.close()
+
+
+class OddsMonitor:
+    """Generate and monitor a live sports-odds scraper for any website.
+
+    Args:
+        url: Live odds page URL.
+        market: Requested market, such as ``moneyline``.
+        api_key: OpenAI API key used for scraper generation and auditing.
+    """
+
+    def __init__(self, url: str, market: str, api_key: str, *, retries: int = 5, wait: float = 10.0):
+        if not api_key:
+            raise ValueError("api_key is required")
+        self.url = url
+        self.market = market
+        self.api_key = api_key
+        self.retries = retries
+        self.wait = wait
+
+    def run(self, on_change: Callable[[OddsEvent], None]) -> int:
+        """Start monitoring and call ``on_change`` for new or changed events."""
+        return run(self.api_key, self.url, self.market, on_change, self.retries, self.wait)

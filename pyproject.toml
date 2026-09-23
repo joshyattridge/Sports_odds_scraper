@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sports-odds-scraper"
+version = "0.1.0"
+description = "Generate and monitor live sports odds scrapers with OpenAI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.68.0",
+    "playwright>=1.40.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.9",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
