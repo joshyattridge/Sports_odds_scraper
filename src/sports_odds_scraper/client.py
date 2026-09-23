@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import importlib.util
 import json
 import logging
@@ -11,12 +12,12 @@ import sys
 from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
-from typing import Callable
+from typing import Awaitable, Callable
 
-from playwright.sync_api import sync_playwright
+from playwright.async_api import Error as PlaywrightError, async_playwright
 
 from .exceptions import ScraperGenerationError
-from .models import OddsEvent, Selection
+from .models import OddsEvent, OddsSnapshot, Selection
 
 MODEL = "gpt-5.6-luna"
 GENERATED = Path("generated_scraper.py")
@@ -105,9 +106,9 @@ def validate_rows(rows: object, market: str) -> tuple[bool, str]:
     return True, f"{len(rows)} valid event(s) for {market}"
 
 
-def audit_completeness(api_key: str, url: str, market: str, snapshot: str, rows: object) -> tuple[bool, str]:
+async def audit_completeness(api_key: str, url: str, market: str, snapshot: str, rows: object) -> tuple[bool, str]:
     """Use a separate model pass to check completeness and exact prices."""
-    from openai import OpenAI
+    from openai import AsyncOpenAI
 
     prompt = f"""Audit a generated sports odds scraper against the complete rendered page.
 URL: {url}
@@ -125,7 +126,7 @@ wrong, or another market (maps, sets, handicap, totals) was included.
 
 COMPLETE RENDERED PAGE:
 {snapshot[:90000]}"""
-    response = OpenAI(api_key=api_key).responses.create(model=MODEL, input=prompt)
+    response = await AsyncOpenAI(api_key=api_key).responses.create(model=MODEL, input=prompt)
     try:
         result = json.loads(clean_code(response.output_text))
     except (json.JSONDecodeError, TypeError) as exc:
@@ -135,10 +136,10 @@ COMPLETE RENDERED PAGE:
     return True, "complete-page audit passed"
 
 
-def generate(api_key: str, url: str, market: str, snapshot: str, feedback: str = "") -> str:
-    from openai import OpenAI
+async def generate(api_key: str, url: str, market: str, snapshot: str, feedback: str = "") -> str:
+    from openai import AsyncOpenAI
 
-    client = OpenAI(api_key=api_key)
+    client = AsyncOpenAI(api_key=api_key)
     prompt = f"""Write a complete Python scraper module for this URL and market.
 URL: {url}
 TARGET MARKET: {market}
@@ -164,7 +165,7 @@ RENDERED SNAPSHOT:
 {snapshot[:50000]}
 
 Return only Python source code."""
-    response = client.responses.create(model=MODEL, input=prompt)
+    response = await client.responses.create(model=MODEL, input=prompt)
     return clean_code(response.output_text)
 
 
@@ -179,12 +180,12 @@ def load_extract(path: Path):
     return module.extract
 
 
-def discover(api_key: str, url: str, market: str, page, retries: int) -> tuple[Path, object]:
-    snapshot = page.locator("body").inner_text()
+async def discover(api_key: str, url: str, market: str, page, retries: int) -> tuple[Path, object]:
+    snapshot = await page.locator("body").inner_text()
     feedback = ""
     for attempt in range(1, retries + 1):
         logger.info("Generating scraper with %s (attempt %d/%d)", MODEL, attempt, retries)
-        code = generate(api_key, url, market, snapshot, feedback)
+        code = await generate(api_key, url, market, snapshot, feedback)
         logger.info("%s returned generated scraper code (%d characters). Validating", MODEL, len(code))
         ok, feedback = safe_code(code)
         if not ok:
@@ -197,7 +198,7 @@ def discover(api_key: str, url: str, market: str, page, retries: int) -> tuple[P
             ok, feedback = validate_rows(rows, market)
             if ok:
                 logger.info("Local validation passed: %s", feedback)
-                ok, audit_feedback = audit_completeness(api_key, url, market, snapshot, rows)
+                ok, audit_feedback = await audit_completeness(api_key, url, market, snapshot, rows)
                 if ok:
                     logger.info("Generated scraper validated on attempt %d: %s", attempt, audit_feedback)
                     return GENERATED, extract
@@ -208,68 +209,125 @@ def discover(api_key: str, url: str, market: str, page, retries: int) -> tuple[P
     raise ScraperGenerationError(f"GPT could not generate a validated scraper: {feedback}")
 
 
-def run(
+class SnapshotProcessor:
+    """Emit complete odds snapshots when the extracted events or prices change."""
+
+    def __init__(self, extract: Callable[[str], object], market: str, odds_format: str, on_snapshot: Callable[[OddsSnapshot], Awaitable[None]]):
+        self.extract = extract
+        self.market = market
+        self.odds_format = odds_format
+        self.on_snapshot = on_snapshot
+        self.previous: dict[str, tuple[tuple[str, str], ...]] = {}
+        self.last_changed: dict[tuple[str, str], tuple[float, datetime]] = {}
+        self.tasks: set[asyncio.Task[None]] = set()
+
+    def _callback_finished(self, task: asyncio.Task[None]) -> None:
+        self.tasks.discard(task)
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            logger.error("Snapshot callback failed", exc_info=(type(exc), exc, exc.__traceback__))
+
+    async def close(self) -> None:
+        for task in self.tasks:
+            task.cancel()
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+
+    def process(self, body: str) -> None:
+        scraped_at = datetime.now(timezone.utc)
+        try:
+            rows = normalise_rows(self.extract(body))
+        except Exception as exc:
+            logger.warning("Skipped snapshot: generated scraper error: %s", exc)
+            return
+        # An empty list is a valid live snapshot after all markets disappear.
+        # Generation still requires a non-empty result for initial validation.
+        ok, message = validate_rows(rows, self.market) if rows != [] else (True, "no active events")
+        if not ok:
+            logger.warning("Skipped invalid snapshot: %s", message)
+            return
+
+        current = {
+            str(row["event"]): tuple((str(s["name"]), str(s["odds"])) for s in row["selections"])
+            for row in rows
+        }
+        if current == self.previous:
+            return
+
+        last_changed = {}
+        events = []
+        for row in rows:
+            event_name = str(row["event"])
+            selections = []
+            for selection in row["selections"]:
+                name = str(selection["name"])
+                odds = float(selection["odds"])
+                key = (event_name, name)
+                previous = self.last_changed.get(key)
+                changed_at = previous[1] if previous is not None and previous[0] == odds else scraped_at
+                last_changed[key] = (odds, changed_at)
+                selections.append(Selection(
+                    name=name,
+                    odds=odds,
+                    formatted_odds=format_odds(odds, self.odds_format),
+                    last_changed_at=changed_at,
+                ))
+            events.append(OddsEvent(event=event_name, selections=tuple(selections)))
+
+        task = asyncio.create_task(self.on_snapshot(OddsSnapshot(scraped_at=scraped_at, events=tuple(events))))
+        self.tasks.add(task)
+        task.add_done_callback(self._callback_finished)
+        self.previous = current
+        self.last_changed = last_changed
+
+
+async def poll_snapshots(page, processor: SnapshotProcessor, interval: float) -> None:
+    """Check the rendered page periodically in case a DOM notification was missed."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            body = await page.locator("body").inner_text()
+        except PlaywrightError as exc:
+            logger.warning("Could not poll page snapshot: %s", exc)
+            continue
+        processor.process(body)
+
+
+async def run(
     api_key: str,
     url: str,
     market: str,
-    on_change: Callable[[OddsEvent], None],
+    on_snapshot: Callable[[OddsSnapshot], Awaitable[None]],
     retries: int = 5,
     wait: float = 30.0,
     odds_format: str = "decimal",
-) -> int:
+    poll_interval: float = 1.0,
+) -> None:
     if not api_key:
         raise ValueError("api_key is required")
     if odds_format not in {"decimal", "fraction"}:
         raise ValueError("odds_format must be 'decimal' or 'fraction'")
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        page = browser.new_page(
+    if poll_interval <= 0:
+        raise ValueError("poll_interval must be greater than 0")
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        page = await browser.new_page(
             viewport={"width": 1920, "height": 1080},
             user_agent=DEFAULT_USER_AGENT,
         )
+        processor = None
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-            page.wait_for_timeout(int(wait * 1000))
-            _, extract = discover(api_key, url, market, page, retries)
-            previous: dict[str, object] = {}
-
-            def process_snapshot(body: str) -> None:
-                nonlocal previous
-                try:
-                    rows = normalise_rows(extract(body))
-                except Exception as exc:
-                    logger.warning("Skipped snapshot: generated scraper error: %s", exc)
-                    return
-                ok, message = validate_rows(rows, market)
-                if ok:
-                    current = {}
-                    for row in rows:
-                        event = str(row["event"])
-                        values = tuple((str(s["name"]), str(s["odds"])) for s in row["selections"])
-                        current[event] = values
-                        if previous.get(event) != values:
-                            on_change(OddsEvent(
-                                event=event,
-                                selections=tuple(
-                                    Selection(
-                                        name=n,
-                                        odds=float(o),
-                                        formatted_odds=format_odds(float(o), odds_format),
-                                    )
-                                    for n, o in values
-                                ),
-                            ))
-                    previous = current
-                else:
-                    logger.warning("Skipped invalid snapshot: %s", message)
+            await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+            await page.wait_for_timeout(int(wait * 1000))
+            _, extract = await discover(api_key, url, market, page, retries)
+            processor = SnapshotProcessor(extract, market, odds_format, on_snapshot)
 
             # Pinnacle updates its React UI from live streams. Observe the
             # rendered DOM and debounce bursts of mutations into one scrape.
-            page.expose_binding(
+            await page.expose_binding(
                 "odds_changed",
-                lambda source, body: process_snapshot(body),
+                lambda source, body: processor.process(body),
             )
-            page.evaluate("""
+            await page.evaluate("""
                 () => {
                     let timer = null;
                     const notify = () => {
@@ -286,14 +344,13 @@ def run(
                     window.__odds_observer_installed = true;
                 }
             """)
-            process_snapshot(page.locator("body").inner_text())
-            logger.info("Watching for live page changes (event-driven)")
-            while True:
-                page.wait_for_timeout(1000)
-        except KeyboardInterrupt:
-            return 0
+            processor.process(await page.locator("body").inner_text())
+            logger.info("Watching for live page changes (DOM observer + %.1fs poll)", poll_interval)
+            await poll_snapshots(page, processor, poll_interval)
         finally:
-            browser.close()
+            if processor is not None:
+                await processor.close()
+            await browser.close()
 
 
 class OddsMonitor:
@@ -305,7 +362,7 @@ class OddsMonitor:
         api_key: OpenAI API key used for scraper generation and auditing.
     """
 
-    def __init__(self, url: str, market: str, api_key: str, *, odds_format: str = "decimal", retries: int = 5, wait: float = 30.0):
+    def __init__(self, url: str, market: str, api_key: str, *, odds_format: str = "decimal", retries: int = 5, wait: float = 30.0, poll_interval: float = 1.0):
         if not api_key:
             raise ValueError("api_key is required")
         self.url = url
@@ -313,10 +370,13 @@ class OddsMonitor:
         self.api_key = api_key
         if odds_format not in {"decimal", "fraction"}:
             raise ValueError("odds_format must be 'decimal' or 'fraction'")
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be greater than 0")
         self.odds_format = odds_format
         self.retries = retries
         self.wait = wait
+        self.poll_interval = poll_interval
 
-    def run(self, on_change: Callable[[OddsEvent], None]) -> int:
-        """Start monitoring and call ``on_change`` for new or changed events."""
-        return run(self.api_key, self.url, self.market, on_change, self.retries, self.wait, self.odds_format)
+    async def run(self, on_snapshot: Callable[[OddsSnapshot], Awaitable[None]]) -> None:
+        """Start monitoring and deliver full snapshots when odds change."""
+        return await run(self.api_key, self.url, self.market, on_snapshot, self.retries, self.wait, self.odds_format, self.poll_interval)

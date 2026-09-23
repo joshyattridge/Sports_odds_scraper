@@ -1,25 +1,30 @@
 """Local command-line runner for the live_scraper library."""
 
 import argparse
+import asyncio
 import os
-from datetime import datetime, timezone
 
-from sports_odds_scraper import OddsMonitor, OddsEvent
-
-
-def print_change(change: OddsEvent) -> None:
-    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    prices = " | ".join(f"{selection.name}: {selection.formatted_odds}" for selection in change.selections)
-    print(f"{stamp} | {change.event} | {prices}", flush=True)
+from sports_odds_scraper import OddsMonitor, OddsSnapshot
 
 
-def main() -> int:
+async def print_change(snapshot: OddsSnapshot) -> None:
+    stamp = snapshot.scraped_at.isoformat(timespec="seconds")
+    for event in snapshot.events:
+        prices = " | ".join(
+            f"{selection.name}: {selection.formatted_odds} (since {selection.last_changed_at.isoformat(timespec='seconds')})"
+            for selection in event.selections
+        )
+        print(f"{stamp} | {event.event} | {prices}", flush=True)
+
+
+async def main() -> None:
     parser = argparse.ArgumentParser(description="Run the AI-generated live odds scraper")
     parser.add_argument("url", help="Live odds page URL")
     parser.add_argument("--market", required=True, help="Market to scrape, e.g. moneyline")
     parser.add_argument("--retries", type=int, default=5, help="Maximum AI generation attempts")
     parser.add_argument("--wait", type=float, default=30, help="Seconds to wait after initial page load")
     parser.add_argument("--odds-format", choices=["decimal", "fraction"], default="decimal")
+    parser.add_argument("--poll-interval", type=float, default=1.0, help="Fallback poll interval in seconds")
     args = parser.parse_args()
     if not os.getenv("OPENAI_API_KEY"):
         parser.error("OPENAI_API_KEY is required")
@@ -30,9 +35,13 @@ def main() -> int:
         odds_format=args.odds_format,
         retries=args.retries,
         wait=args.wait,
+        poll_interval=args.poll_interval,
     )
-    return scraper.run(on_change=print_change)
+    await scraper.run(on_snapshot=print_change)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
