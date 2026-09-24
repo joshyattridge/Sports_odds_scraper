@@ -278,10 +278,28 @@ def load_extract(path: Path):
     return extract
 
 
+_ODDS_TOKEN = re.compile(
+    r"\bEVS\b"
+    r"|\b\d+(?:[.,]\d+)?\s*/\s*\d+(?:[.,]\d+)?\b"
+    r"|\b\d+[.,]\d+\b"
+    r"|(?<!\d)[+-]\d{3,}(?!\d)",
+    re.IGNORECASE,
+)
+
+
+def odds_in_text(text: str) -> tuple[str, ...]:
+    """Odds tokens in one control. Clocks and bare scores are not odds."""
+    tokens = []
+    for match in _ODDS_TOKEN.finditer(text):
+        tokens.append(re.sub(r"\s+", "", match.group(0)).upper().replace(",", "."))
+    return tuple(tokens)
+
+
 def odds_texts(snapshot: str) -> tuple[str, ...]:
-    """Sorted visible odds-control text, used to detect a live price change."""
+    """Sorted odds on visible controls, used to detect a live price change."""
     controls = [control for control in parse_snapshot(snapshot)["controls"] if isinstance(control, dict)]
-    return tuple(sorted(str(control.get("text") or "") for control in controls))
+    tokens = [token for control in controls for token in odds_in_text(str(control.get("text") or ""))]
+    return tuple(sorted(tokens))
 
 
 def feed_status(before: tuple[str, ...], after: tuple[str, ...]) -> tuple[bool, str]:

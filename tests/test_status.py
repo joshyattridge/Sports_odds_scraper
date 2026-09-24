@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from sports_odds_scraper.client import ALLOWED_IMPORTS, audit_completeness, discover, feed_status, safe_code, validate_rows
+from sports_odds_scraper.client import ALLOWED_IMPORTS, audit_completeness, discover, feed_status, odds_texts, safe_code, validate_rows
 from sports_odds_scraper.status import with_status
 
 
@@ -123,6 +123,27 @@ class LiveFeedTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(feed_status(before, before)[0])
         self.assertTrue(feed_status(before, after)[0])
         self.assertIn("no odds controls", feed_status((), after)[1])
+
+    def test_live_check_ignores_clock_changes(self):
+        clock = json.dumps({"text": "", "controls": [
+            {"text": "14:32:35 (GMT +01:00)"},
+            {"text": "+1.5\n1.212"},
+            {"text": "Home 8/11"},
+        ]})
+        clock_tick = json.dumps({"text": "", "controls": [
+            {"text": "14:32:37 (GMT +01:00)"},
+            {"text": "+1.5\n1.212"},
+            {"text": "Home 8/11"},
+        ]})
+        price_change = json.dumps({"text": "", "controls": [
+            {"text": "14:32:37 (GMT +01:00)"},
+            {"text": "+1.5\n1.131"},
+            {"text": "Home 8/11"},
+        ]})
+        self.assertEqual(odds_texts(clock), odds_texts(clock_tick))
+        self.assertFalse(feed_status(odds_texts(clock), odds_texts(clock_tick))[0])
+        self.assertTrue(feed_status(odds_texts(clock), odds_texts(price_change))[0])
+        self.assertIn("no odds controls", feed_status(odds_texts(json.dumps({"text": "", "controls": [{"text": "14:32:35 (GMT +01:00)"}]})), ("1.212",))[1])
 
     async def test_retry_keeps_a_page_whose_odds_are_already_moving(self):
         page_data = {"text": "Game A Home 2.10 Away 1.80", "controls": [
