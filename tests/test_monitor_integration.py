@@ -7,7 +7,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from playwright.async_api import async_playwright
+
 from sports_odds_scraper import OddsMonitor
+from sports_odds_scraper.client import apply_prepare, confirm_live_updates
 from sports_odds_scraper.status import parse_snapshot
 
 
@@ -59,7 +62,7 @@ class MonitorBrowserTests(unittest.IsolatedAsyncioTestCase):
             snapshots = asyncio.Queue()
             page = None
 
-            async def discover_stub(api_key, url, market, browser_page, model, retries):
+            async def discover_stub(api_key, url, market, browser_page, model, retries, stream_wait=60):
                 nonlocal page
                 page = browser_page
                 page_ready.set()
@@ -145,6 +148,32 @@ class MonitorBrowserTests(unittest.IsolatedAsyncioTestCase):
                         await task
                     except asyncio.CancelledError:
                         pass
+
+
+    async def test_prepare_click_starts_a_live_odds_stream(self):
+        html = """<!doctype html><body>
+            <button id="accept">Accept all cookies</button>
+            <section><h2>Game A</h2>
+                <button id="home">Home 2.10</button><button>Away 1.80</button>
+            </section>
+            <script>
+                document.getElementById('accept').onclick = () => {
+                    let tick = 0;
+                    setInterval(() => {
+                        tick += 1;
+                        document.getElementById('home').textContent = 'Home ' + (2.10 + tick / 100).toFixed(2);
+                    }, 200);
+                };
+            </script>
+        </body>"""
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.set_content(html)
+            await apply_prepare(page, [{"action": "click", "role": "button", "name": "Accept all cookies"}])
+            ok, reason = await confirm_live_updates(page, 5)
+            await browser.close()
+        self.assertTrue(ok, reason)
 
 
 if __name__ == "__main__":

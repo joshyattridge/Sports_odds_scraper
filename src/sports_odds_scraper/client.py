@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
@@ -190,9 +191,23 @@ async def generate(api_key: str, url: str, market: str, snapshot: str, model: st
 URL: {url}
 TARGET MARKET: {market}
 
-The module must define these two functions:
+The module must define these three functions:
+    def prepare_actions() -> list[dict]:
     def extract(snapshot: str) -> list[dict]:
     def control_status(control: dict) -> str:
+
+prepare_actions runs in the browser before validation. Return actions that
+remove anything blocking a live odds stream, such as a cookie or consent
+banner, an age check, or a modal over the prices. Return [] when nothing is
+in the way. Each item is one of:
+    {{"action": "click", "role": "button", "name": "Accept all cookies"}}
+    {{"action": "click", "selector": "button.accept"}}
+    {{"action": "click", "text": "Accept all cookies"}}
+    {{"action": "press", "key": "Escape"}}
+    {{"action": "wait", "seconds": 1}}
+Use at most 8 actions. Validation then watches the rendered odds and rejects
+the scraper unless those prices change. The site may deliver updates by
+websocket, polling, or any other channel; only the visible odds matter.
 
 extract receives a JSON string with "text" (rendered body text) and "controls"
 (odds-control DOM metadata). Parse the JSON. Return:
@@ -251,18 +266,96 @@ def load_extract(path: Path):
     spec.loader.exec_module(module)
     extract = getattr(module, "extract", None)
     control_status = getattr(module, "control_status", None)
+    prepare_actions = getattr(module, "prepare_actions", None)
     if not callable(extract):
         raise RuntimeError("generated scraper has no extract(snapshot) function")
     if not callable(control_status):
         raise RuntimeError("generated scraper has no control_status(control) function")
+    if not callable(prepare_actions):
+        raise RuntimeError("generated scraper has no prepare_actions() function")
     extract.control_status = control_status
+    extract.prepare_actions = prepare_actions
     return extract
 
 
-async def discover(api_key: str, url: str, market: str, page, model: str, retries: int) -> tuple[Path, object]:
-    snapshot = await capture_page(page)
+def odds_texts(snapshot: str) -> tuple[str, ...]:
+    """Sorted visible odds-control text, used to detect a live price change."""
+    controls = [control for control in parse_snapshot(snapshot)["controls"] if isinstance(control, dict)]
+    return tuple(sorted(str(control.get("text") or "") for control in controls))
+
+
+def feed_status(before: tuple[str, ...], after: tuple[str, ...]) -> tuple[bool, str]:
+    """Pass when the rendered odds change, whatever transport delivered them."""
+    if not before:
+        return False, "no odds controls were visible when the live-feed check started"
+    if before != after:
+        return True, "visible odds changed during the watch"
+    return False, "visible odds did not change during the watch; dismiss any banner or dialog blocking live updates"
+
+
+def _prepare_locator(page, action: dict):
+    if action.get("selector"):
+        return page.locator(str(action["selector"]))
+    if action.get("role") and action.get("name"):
+        return page.get_by_role(str(action["role"]), name=str(action["name"]))
+    if action.get("text"):
+        return page.get_by_text(str(action["text"]))
+    raise RuntimeError("click action needs selector, role and name, or text")
+
+
+async def apply_prepare(page, actions) -> None:
+    """Run the generated actions that unblock a live odds stream."""
+    if not isinstance(actions, list) or len(actions) > 8:
+        raise RuntimeError("prepare_actions() must return a list of at most 8 actions")
+    for index, action in enumerate(actions, start=1):
+        if not isinstance(action, dict):
+            raise RuntimeError(f"prepare action {index} must be an object")
+        kind = action.get("action")
+        if kind == "click":
+            locator = _prepare_locator(page, action)
+            if await locator.count() == 0:
+                raise RuntimeError(f"prepare click {index} matched no element: {action}")
+            await locator.first.click(timeout=5_000)
+            logger.info("Prepare action %d clicked %s", index, action)
+        elif kind == "press":
+            key = str(action.get("key") or "")
+            if not key:
+                raise RuntimeError(f"prepare press {index} needs a key")
+            await page.keyboard.press(key)
+        elif kind == "wait":
+            seconds = min(max(float(action.get("seconds", 1)), 0), 5)
+            await page.wait_for_timeout(int(seconds * 1000))
+        else:
+            raise RuntimeError(f"prepare action {index} has unsupported action {kind!r}")
+
+
+async def confirm_live_updates(page, seconds: float) -> tuple[bool, str]:
+    """Watch until the rendered odds change, regardless of how the site delivers them."""
+    if seconds <= 0:
+        raise ValueError("stream_wait must be greater than 0")
+    before = odds_texts(await capture_page(page))
+    deadline = time.monotonic() + seconds
+    latest = before
+    while True:
+        ok, reason = feed_status(before, latest)
+        if ok:
+            logger.info("Live odds feed check passed: %s", reason)
+            return True, reason
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.info("Live odds feed check failed: %s", reason)
+            return False, reason
+        await asyncio.sleep(min(1.0, remaining))
+        latest = odds_texts(await capture_page(page))
+
+
+async def discover(api_key: str, url: str, market: str, page, model: str, retries: int, stream_wait: float = 60.0) -> tuple[Path, object]:
     feedback = ""
     for attempt in range(1, retries + 1):
+        if attempt > 1:
+            await page.reload(wait_until="domcontentloaded", timeout=45_000)
+            await page.wait_for_timeout(3_000)
+        snapshot = await capture_page(page)
         logger.info("Generating scraper with %s (attempt %d/%d)", model, attempt, retries)
         code = await generate(api_key, url, market, snapshot, model, feedback)
         logger.info("%s returned generated scraper code (%d characters). Validating", model, len(code))
@@ -273,6 +366,12 @@ async def discover(api_key: str, url: str, market: str, page, model: str, retrie
         GENERATED.write_text(code)
         try:
             extract = load_extract(GENERATED)
+            await apply_prepare(page, extract.prepare_actions())
+            ok, feedback = await confirm_live_updates(page, stream_wait)
+            if not ok:
+                logger.warning("Generated scraper attempt %d failed: %s", attempt, feedback)
+                continue
+            snapshot = await capture_page(page)
             rows = with_status(normalise_rows(extract(snapshot)), snapshot, extract.control_status)
             ok, feedback = validate_rows(rows, market)
             if ok:
@@ -383,6 +482,7 @@ async def run(
     wait: float = 30.0,
     odds_format: str = "decimal",
     poll_interval: float = 1.0,
+    stream_wait: float = 60.0,
 ) -> None:
     if not api_key:
         raise ValueError("api_key is required")
@@ -393,6 +493,8 @@ async def run(
         raise ValueError("odds_format must be 'decimal' or 'fraction'")
     if poll_interval <= 0:
         raise ValueError("poll_interval must be greater than 0")
+    if stream_wait <= 0:
+        raise ValueError("stream_wait must be greater than 0")
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
         page = await browser.new_page(
@@ -403,7 +505,7 @@ async def run(
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
             await page.wait_for_timeout(int(wait * 1000))
-            _, extract = await discover(api_key, url, market, page, model, retries)
+            _, extract = await discover(api_key, url, market, page, model, retries, stream_wait)
             processor = SnapshotProcessor(extract, market, odds_format, on_snapshot)
 
             # Observe text and UI-state attributes, including disabled controls.
@@ -452,7 +554,7 @@ class OddsMonitor:
         model: Model used for scraper generation and auditing, such as ``gpt-6-luna``.
     """
 
-    def __init__(self, url: str, market: str, api_key: str, *, model: str, odds_format: str = "decimal", retries: int = 5, wait: float = 30.0, poll_interval: float = 1.0):
+    def __init__(self, url: str, market: str, api_key: str, *, model: str, odds_format: str = "decimal", retries: int = 5, wait: float = 30.0, poll_interval: float = 1.0, stream_wait: float = 60.0):
         if not api_key:
             raise ValueError("api_key is required")
         if not model or not str(model).strip():
@@ -465,11 +567,14 @@ class OddsMonitor:
             raise ValueError("odds_format must be 'decimal' or 'fraction'")
         if poll_interval <= 0:
             raise ValueError("poll_interval must be greater than 0")
+        if stream_wait <= 0:
+            raise ValueError("stream_wait must be greater than 0")
         self.odds_format = odds_format
         self.retries = retries
         self.wait = wait
         self.poll_interval = poll_interval
+        self.stream_wait = stream_wait
 
     async def run(self, on_snapshot: Callable[[OddsSnapshot], Awaitable[None]]) -> None:
         """Start monitoring and deliver full snapshots when odds change."""
-        return await run(self.api_key, self.url, self.market, on_snapshot, self.model, self.retries, self.wait, self.odds_format, self.poll_interval)
+        return await run(self.api_key, self.url, self.market, on_snapshot, self.model, self.retries, self.wait, self.odds_format, self.poll_interval, self.stream_wait)

@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from sports_odds_scraper.client import ALLOWED_IMPORTS, audit_completeness, discover, safe_code, validate_rows
+from sports_odds_scraper.client import ALLOWED_IMPORTS, audit_completeness, discover, feed_status, safe_code, validate_rows
 from sports_odds_scraper.status import with_status
 
 
@@ -103,6 +103,15 @@ class StatusEvidenceTests(unittest.TestCase):
         self.assertEqual(with_status(evs_rows, evs_page, page_status)[0]["selections"][0]["status"], "enabled")
 
 
+class LiveFeedTests(unittest.TestCase):
+    def test_validation_passes_when_rendered_odds_change(self):
+        before = ("Away 1.80", "Home 2.10")
+        after = ("Away 1.80", "Home 2.20")
+        self.assertFalse(feed_status(before, before)[0])
+        self.assertTrue(feed_status(before, after)[0])
+        self.assertIn("no odds controls", feed_status((), after)[1])
+
+
 class StatusAuditTests(unittest.IsolatedAsyncioTestCase):
     async def test_generation_validates_both_live_statuses_before_monitoring(self):
         page_data = {"text": "Game A Home 2.10 Away 1.80", "controls": [
@@ -125,6 +134,9 @@ def control_status(control):
     if hint.get('tag') == 'button':
         return 'enabled'
     return 'unknown'
+
+def prepare_actions():
+    return []
 """
 
         async def check_audit(api_key, url, market, snapshot, rows, model, code=""):
@@ -135,6 +147,8 @@ def control_status(control):
             output = Path(directory) / "generated_scraper.py"
             with patch("sports_odds_scraper.client.GENERATED", output), \
                  patch("sports_odds_scraper.client.generate", new_callable=AsyncMock, return_value=generated), \
+                 patch("sports_odds_scraper.client.apply_prepare", new_callable=AsyncMock), \
+                 patch("sports_odds_scraper.client.confirm_live_updates", new_callable=AsyncMock, return_value=(True, "live feed")), \
                  patch("sports_odds_scraper.client.audit_completeness", side_effect=check_audit) as audit:
                 page = SimpleNamespace(evaluate=AsyncMock(return_value=page_data))
                 path, scraper = await discover("test-key", "https://example.com", "moneyline", page, "gpt-6-luna", 1)

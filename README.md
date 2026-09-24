@@ -17,9 +17,9 @@ URL + market
     ↓
 Playwright captures rendered text and odds-control DOM attributes
     ↓
-The supplied model generates a dedicated extractor and a page-specific status function
+The supplied model generates an extractor, a status function, and actions that unblock the page
     ↓
-Both are compiled, executed, and audited against the real page and controls
+Those actions run, then validation requires the visible odds to change
     ↓
 MutationObserver detects live page changes, with a one-second polling fallback
     ↓
@@ -117,11 +117,20 @@ control.
   could not tell from the evidence on that control. A visible price by itself
   is not treated as enabled.
 
-During generation, a separate audit checks the prices, the control mappings,
-and **at least one real selection for each enabled or disabled state that page
-actually shows**. A state that never appears is left out of the verified set
-and reported that way in the logs. When the page's availability signal is too
-ambiguous for a reliable rule, those selections stay `unknown`.
+The generated module also defines `prepare_actions`. The library runs those
+actions in the browser before trusting the page. They are how the scraper
+clears a site-specific blocker, such as accepting a cookie banner, so a live
+odds channel can start.
+
+During generation, validation watches the rendered odds for up to 60 seconds.
+It accepts the scraper when those prices change, whether the site pushes them
+over a websocket, polls for them, or uses another channel. A page that loads
+one snapshot and then sits still is rejected, and the model is asked to
+unblock the updates. A separate audit then checks the prices, the control
+mappings, and **at least one real selection for each enabled or disabled state
+that page actually shows**. A state that never appears is left out of the
+verified set and reported that way in the logs. When the page's availability
+signal is too ambiguous for a reliable rule, those selections stay `unknown`.
 
 A status change emits a full snapshot even when the price is unchanged.
 `last_changed_at` still updates only when the numeric odds change. Attribute

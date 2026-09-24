@@ -32,7 +32,7 @@ class SnapshotProcessorTests(unittest.IsolatedAsyncioTestCase):
         with patch("sports_odds_scraper.client.run", new_callable=AsyncMock) as run:
             await monitor.run(on_snapshot=callback)
 
-        run.assert_awaited_once_with("test-key", "https://example.com", "moneyline", callback, "gpt-6-luna", 5, 30.0, "decimal", 1.0)
+        run.assert_awaited_once_with("test-key", "https://example.com", "moneyline", callback, "gpt-6-luna", 5, 30.0, "decimal", 1.0, 60.0)
 
     async def test_poll_finds_missed_change_without_duplicate_observer_callback(self):
         snapshots = {
