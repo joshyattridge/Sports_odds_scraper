@@ -59,7 +59,7 @@ class MonitorBrowserTests(unittest.IsolatedAsyncioTestCase):
             snapshots = asyncio.Queue()
             page = None
 
-            async def discover_stub(api_key, url, market, browser_page, retries):
+            async def discover_stub(api_key, url, market, browser_page, model, retries):
                 nonlocal page
                 page = browser_page
                 page_ready.set()
@@ -68,7 +68,7 @@ class MonitorBrowserTests(unittest.IsolatedAsyncioTestCase):
             async def on_snapshot(snapshot):
                 await snapshots.put(snapshot)
 
-            monitor = OddsMonitor(page_file.as_uri(), "moneyline", "test-key", wait=0, poll_interval=1)
+            monitor = OddsMonitor(page_file.as_uri(), "moneyline", "test-key", model="gpt-6-luna", wait=0, poll_interval=1)
             with patch("sports_odds_scraper.client.discover", side_effect=discover_stub):
                 task = asyncio.create_task(monitor.run(on_snapshot=on_snapshot))
                 try:

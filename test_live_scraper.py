@@ -33,6 +33,7 @@ async def main() -> None:
         args.url,
         market=args.market,
         api_key=os.environ["OPENAI_API_KEY"],
+        model="gpt-6-luna",
         odds_format=args.odds_format,
         retries=args.retries,
         wait=args.wait,

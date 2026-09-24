@@ -3,8 +3,8 @@
 An AI-powered Python package that dynamically learns how to extract sports
 odds from live bookmaker and sportsbook websites.
 
-Give it a URL and a market—such as `moneyline`, `match winner`, or
-`over/under`. GPT-5.6 Luna analyzes the rendered website, generates a
+Give it a URL, a market—such as `moneyline`, `match winner`, or
+`over/under`—and a model. That model analyzes the rendered website, generates a
 page-specific extractor, tests it against the page, and retries when the
 extractor is invalid or incomplete. Once validated, the package monitors the
 page and calls your callback with a full snapshot whenever an event is added,
@@ -17,7 +17,7 @@ URL + market
     ↓
 Playwright captures rendered text and odds-control DOM attributes
     ↓
-GPT-5.6 Luna generates a dedicated extractor and a page-specific status function
+The supplied model generates a dedicated extractor and a page-specific status function
     ↓
 Both are compiled, executed, and audited against the real page and controls
     ↓
@@ -63,6 +63,7 @@ monitor = OddsMonitor(
     url="https://www.pinnacle.com/en/tennis/matchups/live/",
     market="moneyline",
     api_key="your-openai-api-key",
+    model="gpt-6-luna",
     odds_format="decimal",  # or "fraction"
     poll_interval=1.0,  # seconds between fallback page checks
 )
@@ -70,7 +71,7 @@ monitor = OddsMonitor(
 asyncio.run(monitor.run(on_snapshot=handle_odds))
 ```
 
-`OddsMonitor` requires the API key explicitly. The package does not print
+`OddsMonitor` requires the API key and model explicitly. The package does not print
 odds or otherwise format application output; it delivers one typed
 `OddsSnapshot` through the callback when the extracted odds or status change. The first
 callback contains all available events, and every subsequent callback includes
@@ -100,7 +101,7 @@ reset `last_changed_at`.
 
 Every selection has a `status` of `"enabled"`, `"disabled"`, or `"unknown"`.
 
-GPT-5.6 Luna writes a `control_status` function for the page it is looking at.
+The supplied model writes a `control_status` function for the page it is looking at.
 That function reads the captured odds control and its ancestors: tag, class
 names, disabled state, ARIA and data attributes, pointer events, opacity,
 cursor, and nearby text. It returns how that site represents an available price
@@ -142,8 +143,8 @@ python test_live_scraper.py \
   --market moneyline
 ```
 
-The local runner supplies a printing callback so the package can be tested
-directly from a terminal.
+The local runner uses `gpt-6-luna` and supplies a printing callback so the
+package can be tested directly from a terminal.
 
 Use fractional output when needed:
 

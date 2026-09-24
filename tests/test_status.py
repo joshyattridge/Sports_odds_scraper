@@ -127,7 +127,7 @@ def control_status(control):
     return 'unknown'
 """
 
-        async def check_audit(api_key, url, market, snapshot, rows, code=""):
+        async def check_audit(api_key, url, market, snapshot, rows, model, code=""):
             self.assertEqual({s["status"] for s in rows[0]["selections"]}, {"enabled", "disabled"})
             return True, "observed states verified"
 
@@ -137,7 +137,7 @@ def control_status(control):
                  patch("sports_odds_scraper.client.generate", new_callable=AsyncMock, return_value=generated), \
                  patch("sports_odds_scraper.client.audit_completeness", side_effect=check_audit) as audit:
                 page = SimpleNamespace(evaluate=AsyncMock(return_value=page_data))
-                path, scraper = await discover("test-key", "https://example.com", "moneyline", page, 1)
+                path, scraper = await discover("test-key", "https://example.com", "moneyline", page, "gpt-6-luna", 1)
 
             self.assertEqual(path, output)
             self.assertEqual(len(scraper(json.dumps(page_data))[0]["selections"]), 2)
@@ -155,12 +155,12 @@ def control_status(control):
         response = SimpleNamespace(output_text=json.dumps({"complete": True, "verified_statuses": ["enabled"]}))
         with patch("openai.AsyncOpenAI") as openai:
             openai.return_value.responses.create = AsyncMock(return_value=response)
-            passed, reason = await audit_completeness("test-key", "https://example.com", "moneyline", page, rows)
+            passed, reason = await audit_completeness("test-key", "https://example.com", "moneyline", page, rows, "gpt-6-luna")
             self.assertFalse(passed)
             self.assertIn("every observed UI status", reason)
 
             response.output_text = json.dumps({"complete": True, "verified_statuses": ["enabled", "disabled"]})
-            passed, reason = await audit_completeness("test-key", "https://example.com", "moneyline", page, rows)
+            passed, reason = await audit_completeness("test-key", "https://example.com", "moneyline", page, rows, "gpt-6-luna")
             self.assertTrue(passed, reason)
 
 

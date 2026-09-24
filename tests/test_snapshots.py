@@ -24,12 +24,15 @@ class SnapshotProcessorTests(unittest.IsolatedAsyncioTestCase):
         async def callback(snapshot):
             pass
 
-        monitor = OddsMonitor("https://example.com", "moneyline", "test-key")
+        with self.assertRaisesRegex(ValueError, "model is required"):
+            OddsMonitor("https://example.com", "moneyline", "test-key", model="")
+
+        monitor = OddsMonitor("https://example.com", "moneyline", "test-key", model="gpt-6-luna")
 
         with patch("sports_odds_scraper.client.run", new_callable=AsyncMock) as run:
             await monitor.run(on_snapshot=callback)
 
-        run.assert_awaited_once_with("test-key", "https://example.com", "moneyline", callback, 5, 30.0, "decimal", 1.0)
+        run.assert_awaited_once_with("test-key", "https://example.com", "moneyline", callback, "gpt-6-luna", 5, 30.0, "decimal", 1.0)
 
     async def test_poll_finds_missed_change_without_duplicate_observer_callback(self):
         snapshots = {

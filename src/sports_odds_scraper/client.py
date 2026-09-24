@@ -1,4 +1,4 @@
-"""Generate, validate, and run a page-specific odds scraper with GPT-5.6 Luna."""
+"""Generate, validate, and run a page-specific odds scraper with a supplied model."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from .exceptions import ScraperGenerationError
 from .models import OddsEvent, OddsSnapshot, Selection
 from .status import CAPTURE_SCRIPT, parse_snapshot, with_status
 
-MODEL = "gpt-5.6-luna"
 GENERATED = Path("generated_scraper.py")
 ALLOWED_IMPORTS = {"re", "json", "html", "decimal", "fractions", "typing", "dataclasses"}
 DEFAULT_USER_AGENT = (
@@ -137,7 +136,7 @@ def snapshot_for_prompt(snapshot: str, rows: object = None) -> str:
     )
 
 
-async def audit_completeness(api_key: str, url: str, market: str, snapshot: str, rows: object, code: str = "") -> tuple[bool, str]:
+async def audit_completeness(api_key: str, url: str, market: str, snapshot: str, rows: object, model: str, code: str = "") -> tuple[bool, str]:
     """Audit prices, control mappings, and every status observed on this page."""
     from openai import AsyncOpenAI
 
@@ -167,7 +166,7 @@ left unknown, or another market was included.
 
 PAGE AND DOM EVIDENCE:
 {snapshot_for_prompt(snapshot, rows)}"""
-    response = await AsyncOpenAI(api_key=api_key).responses.create(model=MODEL, input=prompt)
+    response = await AsyncOpenAI(api_key=api_key).responses.create(model=model, input=prompt)
     try:
         result = json.loads(clean_code(response.output_text))
     except (json.JSONDecodeError, TypeError) as exc:
@@ -183,7 +182,7 @@ PAGE AND DOM EVIDENCE:
     return True, "complete-page and observed-status audit passed"
 
 
-async def generate(api_key: str, url: str, market: str, snapshot: str, feedback: str = "") -> str:
+async def generate(api_key: str, url: str, market: str, snapshot: str, model: str, feedback: str = "") -> str:
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(api_key=api_key)
@@ -240,7 +239,7 @@ RENDERED SNAPSHOT AND CONTROL METADATA:
 {snapshot_for_prompt(snapshot)}
 
 Return only Python source code."""
-    response = await client.responses.create(model=MODEL, input=prompt)
+    response = await client.responses.create(model=model, input=prompt)
     return clean_code(response.output_text)
 
 
@@ -260,13 +259,13 @@ def load_extract(path: Path):
     return extract
 
 
-async def discover(api_key: str, url: str, market: str, page, retries: int) -> tuple[Path, object]:
+async def discover(api_key: str, url: str, market: str, page, model: str, retries: int) -> tuple[Path, object]:
     snapshot = await capture_page(page)
     feedback = ""
     for attempt in range(1, retries + 1):
-        logger.info("Generating scraper with %s (attempt %d/%d)", MODEL, attempt, retries)
-        code = await generate(api_key, url, market, snapshot, feedback)
-        logger.info("%s returned generated scraper code (%d characters). Validating", MODEL, len(code))
+        logger.info("Generating scraper with %s (attempt %d/%d)", model, attempt, retries)
+        code = await generate(api_key, url, market, snapshot, model, feedback)
+        logger.info("%s returned generated scraper code (%d characters). Validating", model, len(code))
         ok, feedback = safe_code(code)
         if not ok:
             logger.warning("Generated code rejected: %s", feedback)
@@ -278,7 +277,7 @@ async def discover(api_key: str, url: str, market: str, page, retries: int) -> t
             ok, feedback = validate_rows(rows, market)
             if ok:
                 logger.info("Local validation passed: %s", feedback)
-                ok, audit_feedback = await audit_completeness(api_key, url, market, snapshot, rows, code)
+                ok, audit_feedback = await audit_completeness(api_key, url, market, snapshot, rows, model, code)
                 if ok:
                     logger.info("Generated scraper validated on attempt %d: %s", attempt, audit_feedback)
                     return GENERATED, extract
@@ -379,6 +378,7 @@ async def run(
     url: str,
     market: str,
     on_snapshot: Callable[[OddsSnapshot], Awaitable[None]],
+    model: str,
     retries: int = 5,
     wait: float = 30.0,
     odds_format: str = "decimal",
@@ -386,6 +386,9 @@ async def run(
 ) -> None:
     if not api_key:
         raise ValueError("api_key is required")
+    if not model or not str(model).strip():
+        raise ValueError("model is required")
+    model = str(model).strip()
     if odds_format not in {"decimal", "fraction"}:
         raise ValueError("odds_format must be 'decimal' or 'fraction'")
     if poll_interval <= 0:
@@ -400,7 +403,7 @@ async def run(
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
             await page.wait_for_timeout(int(wait * 1000))
-            _, extract = await discover(api_key, url, market, page, retries)
+            _, extract = await discover(api_key, url, market, page, model, retries)
             processor = SnapshotProcessor(extract, market, odds_format, on_snapshot)
 
             # Observe text and UI-state attributes, including disabled controls.
@@ -446,14 +449,18 @@ class OddsMonitor:
         url: Live odds page URL.
         market: Requested market, such as ``moneyline``.
         api_key: OpenAI API key used for scraper generation and auditing.
+        model: Model used for scraper generation and auditing, such as ``gpt-6-luna``.
     """
 
-    def __init__(self, url: str, market: str, api_key: str, *, odds_format: str = "decimal", retries: int = 5, wait: float = 30.0, poll_interval: float = 1.0):
+    def __init__(self, url: str, market: str, api_key: str, *, model: str, odds_format: str = "decimal", retries: int = 5, wait: float = 30.0, poll_interval: float = 1.0):
         if not api_key:
             raise ValueError("api_key is required")
+        if not model or not str(model).strip():
+            raise ValueError("model is required")
         self.url = url
         self.market = market
         self.api_key = api_key
+        self.model = str(model).strip()
         if odds_format not in {"decimal", "fraction"}:
             raise ValueError("odds_format must be 'decimal' or 'fraction'")
         if poll_interval <= 0:
@@ -465,4 +472,4 @@ class OddsMonitor:
 
     async def run(self, on_snapshot: Callable[[OddsSnapshot], Awaitable[None]]) -> None:
         """Start monitoring and deliver full snapshots when odds change."""
-        return await run(self.api_key, self.url, self.market, on_snapshot, self.retries, self.wait, self.odds_format, self.poll_interval)
+        return await run(self.api_key, self.url, self.market, on_snapshot, self.model, self.retries, self.wait, self.odds_format, self.poll_interval)
