@@ -15,9 +15,9 @@ CAPTURE_SCRIPT = r"""() => {
     function add(element) {
         // A numeric price span may be inside the actual betting button.
         element = element?.closest('button, a[href], [role="button"]') || element;
-        if (!element || seen.has(element) || controls.length >= 1500) return;
+        if (!element || seen.has(element)) return;
         const text = (element.innerText || '').trim();
-        if (!text || text.length > 180 || !price.test(text)) return;
+        if (!text || !price.test(text)) return;
         const style = getComputedStyle(element);
         if (!element.getClientRects().length || style.display === 'none' || style.visibility === 'hidden') return;
         seen.add(element);
@@ -46,12 +46,12 @@ CAPTURE_SCRIPT = r"""() => {
         const contexts = [];
         for (let parent = element.parentElement, depth = 0; parent && depth < 5; parent = parent.parentElement, depth++) {
             const context = (parent.innerText || '').trim();
-            if (context && context.length < 500 && !contexts.includes(context)) contexts.push(context);
+            if (context && !contexts.includes(context)) contexts.push(context);
         }
         controls.push({
             id: controls.length,
-            text: text.slice(0, 180),
-            context: contexts.join(' | ').slice(0, 600),
+            text,
+            context: contexts.join(' | '),
             hints,
         });
     }
@@ -60,7 +60,7 @@ CAPTURE_SCRIPT = r"""() => {
     for (const element of body.querySelectorAll(actionable)) add(element);
     const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
     let node;
-    while ((node = walker.nextNode()) && controls.length < 1500) {
+    while ((node = walker.nextNode())) {
         if (!price.test(node.nodeValue || '')) continue;
         const parent = node.parentElement;
         const control = parent?.closest(actionable) || parent;

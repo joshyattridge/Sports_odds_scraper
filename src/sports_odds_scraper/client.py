@@ -131,9 +131,9 @@ def snapshot_for_prompt(snapshot: str, rows: object = None) -> str:
             + [c for c in controls if isinstance(c, dict) and c.get("id") not in referenced]
         )
     return (
-        "RENDERED PAGE TEXT:\n" + str(data.get("text", ""))[:35000]
+        "RENDERED PAGE TEXT:\n" + str(data.get("text", ""))
         + "\nODDS CONTROL DOM METADATA (id, text, context, attribute hints):\n"
-        + json.dumps(controls, ensure_ascii=False)[:45000]
+        + json.dumps(controls, ensure_ascii=False)
     )
 
 
