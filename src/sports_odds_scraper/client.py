@@ -351,8 +351,9 @@ async def confirm_live_updates(page, seconds: float) -> tuple[bool, str]:
 
 async def discover(api_key: str, url: str, market: str, page, model: str, retries: int, stream_wait: float = 60.0) -> tuple[Path, object]:
     feedback = ""
+    live = False
     for attempt in range(1, retries + 1):
-        if attempt > 1:
+        if attempt > 1 and not live:
             await page.reload(wait_until="domcontentloaded", timeout=45_000)
             await page.wait_for_timeout(3_000)
         snapshot = await capture_page(page)
@@ -366,11 +367,13 @@ async def discover(api_key: str, url: str, market: str, page, model: str, retrie
         GENERATED.write_text(code)
         try:
             extract = load_extract(GENERATED)
-            await apply_prepare(page, extract.prepare_actions())
-            ok, feedback = await confirm_live_updates(page, stream_wait)
-            if not ok:
-                logger.warning("Generated scraper attempt %d failed: %s", attempt, feedback)
-                continue
+            if not live:
+                await apply_prepare(page, extract.prepare_actions())
+                ok, feedback = await confirm_live_updates(page, stream_wait)
+                if not ok:
+                    logger.warning("Generated scraper attempt %d failed: %s", attempt, feedback)
+                    continue
+                live = True
             snapshot = await capture_page(page)
             rows = with_status(normalise_rows(extract(snapshot)), snapshot, extract.control_status)
             ok, feedback = validate_rows(rows, market)
