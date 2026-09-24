@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 from sports_odds_scraper import OddsMonitor
 from sports_odds_scraper.client import SnapshotProcessor, poll_snapshots
 from sports_odds_scraper.models import OddsSnapshot
+from sports_odds_scraper.status import parse_snapshot
 
 
 def row(event, first, second):
@@ -44,17 +45,13 @@ class SnapshotProcessorTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.bodies = iter(["initial", "changed"])
 
-            def locator(self, selector):
-                assert selector == "body"
-                return self
-
-            async def inner_text(self):
+            async def evaluate(self, script):
                 body = next(self.bodies, None)
                 if body is None:
                     raise asyncio.CancelledError
-                return body
+                return {"text": body, "controls": []}
 
-        processor = SnapshotProcessor(snapshots.__getitem__, "moneyline", "decimal", on_snapshot)
+        processor = SnapshotProcessor(lambda body: snapshots[parse_snapshot(body)["text"]], "moneyline", "decimal", on_snapshot)
         try:
             processor.process("initial")  # Observer already detected the initial odds.
             with self.assertRaises(asyncio.CancelledError):
@@ -100,6 +97,7 @@ class SnapshotProcessorTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(received[1].events[0].selections[0].odds, 2.20)
         self.assertEqual(received[1].events[1].selections[0].formatted_odds, "3.000")
+        self.assertEqual(received[1].events[0].selections[0].status, "unknown")
         self.assertEqual(received[0].events[0].selections[0].last_changed_at, received[0].scraped_at)
         self.assertEqual(received[1].events[0].selections[0].last_changed_at, received[1].scraped_at)
         self.assertEqual(received[1].events[0].selections[1].last_changed_at, received[1].scraped_at)

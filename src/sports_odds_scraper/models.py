@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Tuple
+from typing import Literal, Tuple
 
 
 @dataclass(frozen=True)
@@ -11,6 +11,7 @@ class Selection:
     odds: float
     formatted_odds: str
     last_changed_at: datetime
+    status: Literal["enabled", "disabled", "unknown"]
 
 
 @dataclass(frozen=True)

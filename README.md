@@ -8,26 +8,26 @@ Give it a URL and a market—such as `moneyline`, `match winner`, or
 page-specific extractor, tests it against the page, and retries when the
 extractor is invalid or incomplete. Once validated, the package monitors the
 page and calls your callback with a full snapshot whenever an event is added,
-removed, or its odds change.
+removed, or its odds or UI status change.
 
 ## How it works
 
 ```text
 URL + market
     ↓
-Playwright renders the website
+Playwright captures rendered text and odds-control DOM attributes
     ↓
-GPT-5.6 Luna generates a dedicated extractor
+GPT-5.6 Luna generates a dedicated extractor and a page-specific status function
     ↓
-The extractor is compiled, executed, and audited against the page
+Both are compiled, executed, and audited against the real page and controls
     ↓
 MutationObserver detects live page changes, with a one-second polling fallback
     ↓
-Your callback receives every event and its odds, with a UTC scrape timestamp
+Your callback receives every event, price, and UI status, with a UTC scrape timestamp
 ```
 
 The model is used during scraper generation and validation, not for every
-individual odds tick. The generated extractor is saved locally as
+individual odds tick. The generated module is saved locally as
 `generated_scraper.py` and ignored by Git.
 
 ## Installation
@@ -56,7 +56,8 @@ async def handle_odds(snapshot: OddsSnapshot) -> None:
     for event in snapshot.events:
         print(event.event)
         for selection in event.selections:
-            print(f"  {selection.name}: {selection.odds} (since {selection.last_changed_at})")
+            print(f"  {selection.name}: {selection.odds} [{selection.status}] "
+                  f"(since {selection.last_changed_at})")
 
 monitor = OddsMonitor(
     url="https://www.pinnacle.com/en/tennis/matchups/live/",
@@ -71,7 +72,7 @@ asyncio.run(monitor.run(on_snapshot=handle_odds))
 
 `OddsMonitor` requires the API key explicitly. The package does not print
 odds or otherwise format application output; it delivers one typed
-`OddsSnapshot` through the callback when the extracted odds change. The first
+`OddsSnapshot` through the callback when the extracted odds or status change. The first
 callback contains all available events, and every subsequent callback includes
 all currently available events, not only the changed one. `scraped_at` is a
 timezone-aware UTC `datetime` recorded when the page snapshot is processed.
@@ -92,7 +93,45 @@ It is set to `scraped_at` when the selection is first seen, and changes only
 when its numeric odds change. An unchanged selection carries its previous
 timestamp into the next full snapshot. If a selection disappears and later
 returns, it is treated as newly seen. This is the time the scraper observed the
-price, not the bookmaker's exact update time.
+price, not the bookmaker's exact update time. Changing only `status` does not
+reset `last_changed_at`.
+
+### Selection status
+
+Every selection has a `status` of `"enabled"`, `"disabled"`, or `"unknown"`.
+
+GPT-5.6 Luna writes a `control_status` function for the page it is looking at.
+That function reads the captured odds control and its ancestors: tag, class
+names, disabled state, ARIA and data attributes, pointer events, opacity,
+cursor, and nearby text. It returns how that site represents an available price
+and how it represents a suspended, locked, or otherwise unavailable price. The
+library runs this function on the matched control for every snapshot. Because
+the rule is generated from the page, a site that marks availability in its own
+way can still be interpreted, as long as the signal is present in the captured
+control.
+
+- `enabled`: the generated function decided this control can be bet.
+- `disabled`: the generated function decided this control is unavailable.
+- `unknown`: no control matched the selection's price, or the generated function
+  could not tell from the evidence on that control. A visible price by itself
+  is not treated as enabled.
+
+During generation, a separate audit checks the prices, the control mappings,
+and **at least one real selection for each enabled or disabled state that page
+actually shows**. A state that never appears is left out of the verified set
+and reported that way in the logs. When the page's availability signal is too
+ambiguous for a reliable rule, those selections stay `unknown`.
+
+A status change emits a full snapshot even when the price is unchanged.
+`last_changed_at` still updates only when the numeric odds change. Attribute
+changes are watched directly, and the one-second poll checks them again if a
+mutation notification was missed.
+
+`status` describes the website's observable UI. It is not a guarantee that a
+bookmaker will accept a bet. Only selections with a visible numeric price are
+included. A suspended market that removes its prices disappears from the
+snapshot. Odds that live only inside an inaccessible iframe or a closed shadow
+root are absent from the capture, so their status stays `unknown`.
 
 ## Local example
 
@@ -123,6 +162,7 @@ src/sports_odds_scraper/
 ├── __init__.py       # Public API
 ├── client.py         # OddsMonitor implementation
 ├── models.py         # OddsSnapshot, OddsEvent, and Selection models
+├── status.py         # DOM capture; generated code interprets selection status
 └── exceptions.py     # Public exception types
 ```
 
@@ -131,5 +171,5 @@ src/sports_odds_scraper/
 - Website layouts and anti-bot systems can change.
 - Generated code is executed locally after import and output checks; review
   your security model before using untrusted URLs.
-- Validation improves reliability but cannot mathematically guarantee that a
-  website has exposed every market or event.
+- Validation improves reliability but cannot guarantee that every website
+  exposes a usable odds control or an example of each status.

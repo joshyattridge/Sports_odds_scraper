@@ -18,10 +18,11 @@ from playwright.async_api import Error as PlaywrightError, async_playwright
 
 from .exceptions import ScraperGenerationError
 from .models import OddsEvent, OddsSnapshot, Selection
+from .status import CAPTURE_SCRIPT, parse_snapshot, with_status
 
 MODEL = "gpt-5.6-luna"
 GENERATED = Path("generated_scraper.py")
-ALLOWED_IMPORTS = {"re", "json", "html", "decimal", "typing", "dataclasses"}
+ALLOWED_IMPORTS = {"re", "json", "html", "decimal", "fractions", "typing", "dataclasses"}
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -97,6 +98,11 @@ def validate_rows(rows: object, market: str) -> tuple[bool, str]:
         for selection in row["selections"]:
             if not isinstance(selection, dict) or not selection.get("name"):
                 return False, "each selection needs a name"
+            if selection.get("status", "unknown") not in {"enabled", "disabled", "unknown"}:
+                return False, "each selection needs a valid status"
+            control_id = selection.get("control_id")
+            if control_id is not None and type(control_id) is not int:
+                return False, "control_id must be an integer or null"
             try:
                 odds = float(selection["odds"])
             except (KeyError, TypeError, ValueError):
@@ -106,26 +112,61 @@ def validate_rows(rows: object, market: str) -> tuple[bool, str]:
     return True, f"{len(rows)} valid event(s) for {market}"
 
 
-async def audit_completeness(api_key: str, url: str, market: str, snapshot: str, rows: object) -> tuple[bool, str]:
-    """Use a separate model pass to check completeness and exact prices."""
+async def capture_page(page) -> str:
+    """Read text and real odds-control attributes in a single browser snapshot."""
+    return json.dumps(await page.evaluate(CAPTURE_SCRIPT), ensure_ascii=False)
+
+
+def snapshot_for_prompt(snapshot: str, rows: object = None) -> str:
+    data = parse_snapshot(snapshot)
+    controls = data["controls"]
+    if isinstance(rows, list):
+        referenced = {
+            selection.get("control_id")
+            for row in rows if isinstance(row, dict)
+            for selection in row.get("selections", []) if isinstance(selection, dict)
+        }
+        controls = (
+            [c for c in controls if isinstance(c, dict) and c.get("id") in referenced]
+            + [c for c in controls if isinstance(c, dict) and c.get("id") not in referenced]
+        )
+    return (
+        "RENDERED PAGE TEXT:\n" + str(data.get("text", ""))[:35000]
+        + "\nODDS CONTROL DOM METADATA (id, text, context, attribute hints):\n"
+        + json.dumps(controls, ensure_ascii=False)[:45000]
+    )
+
+
+async def audit_completeness(api_key: str, url: str, market: str, snapshot: str, rows: object, code: str = "") -> tuple[bool, str]:
+    """Audit prices, control mappings, and every status observed on this page."""
     from openai import AsyncOpenAI
 
-    prompt = f"""Audit a generated sports odds scraper against the complete rendered page.
+    generated_block = f"GENERATED SCRAPER:\n{code}\n" if code else ""
+    prompt = f"""Audit a generated sports odds scraper against the rendered page and odds-control DOM evidence.
 URL: {url}
 REQUESTED MARKET: {market}
 EXTRACTED JSON:
 {json.dumps(rows, ensure_ascii=False)}
+{generated_block}
 
-Compare the extracted events and prices against the entire page text below.
-Ignore suspended markets with no prices and ignore every other market type.
+Compare the events, prices, and each selection's control_id against the page
+text AND the DOM controls below. Each status was produced by running the
+generated control_status function on the matched control. Confirm at least
+one real example for EVERY status (enabled/disabled) present in the extracted
+selections. Unknown means that function found insufficient evidence on the
+control. If no disabled control appears on this page, leave it out of
+verified_statuses.
+Ignore other market types and suspended selections that show no price.
 Return ONLY JSON:
-{{"complete": true, "missing": [], "extra": [], "mismatched": [], "notes": ""}}
+{{"complete": true, "missing": [], "extra": [], "mismatched": [], "verified_statuses": ["enabled"], "notes": ""}}
 
 Set complete=false if any available target-market event is missing, any odds are
-wrong, or another market (maps, sets, handicap, totals) was included.
+wrong, a selection is linked to the wrong odds control, control_status
+contradicts the control's DOM evidence, a clearly identifiable odds control was
+left unknown, or another market was included.
 
-COMPLETE RENDERED PAGE:
-{snapshot[:90000]}"""
+PAGE AND DOM EVIDENCE:
+{snapshot_for_prompt(snapshot, rows)}"""
     response = await AsyncOpenAI(api_key=api_key).responses.create(model=MODEL, input=prompt)
     try:
         result = json.loads(clean_code(response.output_text))
@@ -133,7 +174,13 @@ COMPLETE RENDERED PAGE:
         return False, f"AI completeness audit returned invalid JSON: {exc}"
     if result.get("complete") is not True:
         return False, "AI completeness audit failed: " + json.dumps(result, ensure_ascii=False)
-    return True, "complete-page audit passed"
+    observed = {s["status"] for row in rows for s in row["selections"] if s["status"] != "unknown"}
+    verified = result.get("verified_statuses", [])
+    if not isinstance(verified, list) or not all(isinstance(s, str) for s in verified) or not observed.issubset(set(verified)):
+        return False, f"AI did not verify every observed UI status: {sorted(observed)}"
+    logger.info("Real-page status validation: verified %s; not observed %s",
+                sorted(observed), sorted({"enabled", "disabled"} - observed))
+    return True, "complete-page and observed-status audit passed"
 
 
 async def generate(api_key: str, url: str, market: str, snapshot: str, feedback: str = "") -> str:
@@ -144,25 +191,53 @@ async def generate(api_key: str, url: str, market: str, snapshot: str, feedback:
 URL: {url}
 TARGET MARKET: {market}
 
-The module must define exactly this function:
+The module must define these two functions:
     def extract(snapshot: str) -> list[dict]:
+    def control_status(control: dict) -> str:
 
-It receives rendered body text from the page and must return:
-[{{"event": "event name", "selections": [{{"name": "player/team", "odds": "2.10"}}]}}]
+extract receives a JSON string with "text" (rendered body text) and "controls"
+(odds-control DOM metadata). Parse the JSON. Return:
+[{{"event": "event name", "selections": [{{"name": "player/team", "odds": "2.10", "control_id": 12}}]}}]
+
+For each selection, find the matching control by price, text and surrounding
+event/market context. Return its id, or null if no unambiguous matching control
+exists. Never invent a control id. A fractional button price and its decimal
+form are the same price when they agree after rounding to 3 decimal places:
+1/150 and 1.007 match. EVS means even money and matches 2.000. Do not reject
+a control because the unrounded fraction differs from that decimal.
+
+control_status is called later with one control object, after the library has
+matched that control's visible text to the selection price. Return exactly
+"enabled", "disabled", or "unknown". Write it from the patterns on THIS page.
+Read the control and its ancestor hints — tag, role, class_name, disabled,
+aria_disabled, data_state, data_status, data_available, attributes (every
+data-* and aria-* name/value), pointer_events, opacity, cursor — plus the
+control text and context. Decide how this site shows that a price can be bet,
+and how it shows that a price is suspended, locked, or otherwise unavailable.
+The same function runs on later snapshots, so base it on those stable DOM
+signals. Return "unknown" when that control does not contain enough evidence.
+A visible price on its own is not evidence of enabled. Keep the rule general:
+do not special-case event names, selection names, or particular prices.
+
+Each control has this shape:
+{{"id": 0, "text": "Home 2.10", "context": "Game A", "hints": [{{"tag": "button", "role": null, "href": false, "disabled": false, "aria_disabled": null, "class_name": "price", "data_state": null, "data_status": null, "data_available": null, "attributes": [["data-coupon-state", "open"]], "pointer_events": "auto", "opacity": "1", "cursor": "pointer"}}]}}
+hints[0] is the odds control. Later hints are ancestors, nearest first.
 
 Rules:
 - Return only the requested market, not handicap, totals, maps, sets, or games.
-- Return all odds as decimal strings greater than 1. Convert fractional odds
-  such as 5/2 to decimal odds such as 3.500.
+- Return all odds as decimal strings greater than 1, with 3 decimal places.
+  Convert fractional odds such as 5/2 to 3.500 and 1/150 to 1.007. The
+  fractions module is allowed.
 - Use only the supplied snapshot; do not make network calls.
 - Use standard-library imports only.
 - Include no CLI, infinite loop, file writes, subprocesses, or explanation.
-- Return [] when the market is absent or suspended.
+- Include all requested-market selections with a visible price even if disabled.
+- Return [] from extract when the requested market has no visible prices.
 
 {('PREVIOUS VALIDATION FEEDBACK: ' + feedback) if feedback else ''}
 
-RENDERED SNAPSHOT:
-{snapshot[:50000]}
+RENDERED SNAPSHOT AND CONTROL METADATA:
+{snapshot_for_prompt(snapshot)}
 
 Return only Python source code."""
     response = await client.responses.create(model=MODEL, input=prompt)
@@ -175,13 +250,18 @@ def load_extract(path: Path):
         raise RuntimeError("could not load generated scraper")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    if not callable(getattr(module, "extract", None)):
+    extract = getattr(module, "extract", None)
+    control_status = getattr(module, "control_status", None)
+    if not callable(extract):
         raise RuntimeError("generated scraper has no extract(snapshot) function")
-    return module.extract
+    if not callable(control_status):
+        raise RuntimeError("generated scraper has no control_status(control) function")
+    extract.control_status = control_status
+    return extract
 
 
 async def discover(api_key: str, url: str, market: str, page, retries: int) -> tuple[Path, object]:
-    snapshot = await page.locator("body").inner_text()
+    snapshot = await capture_page(page)
     feedback = ""
     for attempt in range(1, retries + 1):
         logger.info("Generating scraper with %s (attempt %d/%d)", MODEL, attempt, retries)
@@ -194,11 +274,11 @@ async def discover(api_key: str, url: str, market: str, page, retries: int) -> t
         GENERATED.write_text(code)
         try:
             extract = load_extract(GENERATED)
-            rows = normalise_rows(extract(snapshot))
+            rows = with_status(normalise_rows(extract(snapshot)), snapshot, extract.control_status)
             ok, feedback = validate_rows(rows, market)
             if ok:
                 logger.info("Local validation passed: %s", feedback)
-                ok, audit_feedback = await audit_completeness(api_key, url, market, snapshot, rows)
+                ok, audit_feedback = await audit_completeness(api_key, url, market, snapshot, rows, code)
                 if ok:
                     logger.info("Generated scraper validated on attempt %d: %s", attempt, audit_feedback)
                     return GENERATED, extract
@@ -214,10 +294,11 @@ class SnapshotProcessor:
 
     def __init__(self, extract: Callable[[str], object], market: str, odds_format: str, on_snapshot: Callable[[OddsSnapshot], Awaitable[None]]):
         self.extract = extract
+        self.control_status = getattr(extract, "control_status", None)
         self.market = market
         self.odds_format = odds_format
         self.on_snapshot = on_snapshot
-        self.previous: dict[str, tuple[tuple[str, str], ...]] = {}
+        self.previous: dict[str, tuple[tuple[str, str, str], ...]] = {}
         self.last_changed: dict[tuple[str, str], tuple[float, datetime]] = {}
         self.tasks: set[asyncio.Task[None]] = set()
 
@@ -235,7 +316,7 @@ class SnapshotProcessor:
     def process(self, body: str) -> None:
         scraped_at = datetime.now(timezone.utc)
         try:
-            rows = normalise_rows(self.extract(body))
+            rows = with_status(normalise_rows(self.extract(body)), body, self.control_status)
         except Exception as exc:
             logger.warning("Skipped snapshot: generated scraper error: %s", exc)
             return
@@ -247,7 +328,7 @@ class SnapshotProcessor:
             return
 
         current = {
-            str(row["event"]): tuple((str(s["name"]), str(s["odds"])) for s in row["selections"])
+            str(row["event"]): tuple((str(s["name"]), str(s["odds"]), s["status"]) for s in row["selections"])
             for row in rows
         }
         if current == self.previous:
@@ -270,6 +351,7 @@ class SnapshotProcessor:
                     odds=odds,
                     formatted_odds=format_odds(odds, self.odds_format),
                     last_changed_at=changed_at,
+                    status=selection["status"],
                 ))
             events.append(OddsEvent(event=event_name, selections=tuple(selections)))
 
@@ -285,7 +367,7 @@ async def poll_snapshots(page, processor: SnapshotProcessor, interval: float) ->
     while True:
         await asyncio.sleep(interval)
         try:
-            body = await page.locator("body").inner_text()
+            body = await capture_page(page)
         except PlaywrightError as exc:
             logger.warning("Could not poll page snapshot: %s", exc)
             continue
@@ -321,30 +403,34 @@ async def run(
             _, extract = await discover(api_key, url, market, page, retries)
             processor = SnapshotProcessor(extract, market, odds_format, on_snapshot)
 
-            # Pinnacle updates its React UI from live streams. Observe the
-            # rendered DOM and debounce bursts of mutations into one scrape.
+            # Observe text and UI-state attributes, including disabled controls.
             await page.expose_binding(
                 "odds_changed",
                 lambda source, body: processor.process(body),
             )
+            await page.evaluate("""() => {
+                window.__capture_odds_snapshot = (""" + CAPTURE_SCRIPT + """);
+            }""")
             await page.evaluate("""
                 () => {
                     let timer = null;
                     const notify = () => {
                         clearTimeout(timer);
                         timer = setTimeout(() => {
-                            window.odds_changed(document.body.innerText);
+                            window.odds_changed(JSON.stringify(window.__capture_odds_snapshot()));
                         }, 250);
                     };
-                    new MutationObserver(notify).observe(document.body, {
+                    window.__odds_observer = new MutationObserver(notify);
+                    window.__odds_observer.observe(document.body, {
                         subtree: true,
                         childList: true,
                         characterData: true,
+                        attributes: true,
                     });
                     window.__odds_observer_installed = true;
                 }
             """)
-            processor.process(await page.locator("body").inner_text())
+            processor.process(await capture_page(page))
             logger.info("Watching for live page changes (DOM observer + %.1fs poll)", poll_interval)
             await poll_snapshots(page, processor, poll_interval)
         finally:

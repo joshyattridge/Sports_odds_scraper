@@ -11,7 +11,8 @@ async def print_change(snapshot: OddsSnapshot) -> None:
     stamp = snapshot.scraped_at.isoformat(timespec="seconds")
     for event in snapshot.events:
         prices = " | ".join(
-            f"{selection.name}: {selection.formatted_odds} (since {selection.last_changed_at.isoformat(timespec='seconds')})"
+            f"{selection.name}: {selection.formatted_odds} [{selection.status}] "
+            f"(since {selection.last_changed_at.isoformat(timespec='seconds')})"
             for selection in event.selections
         )
         print(f"{stamp} | {event.event} | {prices}", flush=True)
