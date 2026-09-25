@@ -5,7 +5,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from sports_odds_scraper.client import ALLOWED_IMPORTS, audit_completeness, discover, feed_status, odds_texts, safe_code, validate_rows
+from sports_odds_scraper.client import (
+    ALLOWED_IMPORTS,
+    audit_completeness,
+    discover,
+    example_cache_path,
+    feed_status,
+    load_scraper_example,
+    odds_texts,
+    safe_code,
+    save_scraper_example,
+    validate_rows,
+)
 from sports_odds_scraper.status import with_status
 
 
@@ -162,6 +173,7 @@ class LiveFeedTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "generated_scraper.py"
             with patch("sports_odds_scraper.client.GENERATED", output), \
+                 patch("sports_odds_scraper.client.CACHE_DIR", Path(directory) / "cache"), \
                  patch("sports_odds_scraper.client.generate", new_callable=AsyncMock, side_effect=[incomplete, complete]), \
                  patch("sports_odds_scraper.client.apply_prepare", new_callable=AsyncMock) as prepare, \
                  patch("sports_odds_scraper.client.confirm_live_updates", new_callable=AsyncMock, return_value=(True, "live feed")), \
@@ -187,6 +199,7 @@ class LiveFeedTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "generated_scraper.py"
             with patch("sports_odds_scraper.client.GENERATED", output), \
+                 patch("sports_odds_scraper.client.CACHE_DIR", Path(directory) / "cache"), \
                  patch("sports_odds_scraper.client.generate", new_callable=AsyncMock, return_value=generated), \
                  patch("sports_odds_scraper.client.apply_prepare", new_callable=AsyncMock), \
                  patch("sports_odds_scraper.client.confirm_live_updates", new_callable=AsyncMock, side_effect=[
@@ -197,6 +210,40 @@ class LiveFeedTests(unittest.IsolatedAsyncioTestCase):
                 await discover("test-key", "https://example.com", "moneyline", page, "gpt-6-luna", 2)
 
         page.reload.assert_awaited_once()
+
+    async def test_stored_scraper_is_included_in_the_next_prompt(self):
+        page_data = {"text": "Game A Home 2.10 Away 1.80", "controls": [
+            control(0, "2.10", {"tag": "button"}),
+            control(1, "1.80", {"tag": "button"}),
+        ]}
+        previous = "def control_status(control):\n    return 'enabled'\n"
+        complete = scraper_module(
+            "{'name': 'Home', 'odds': '2.10', 'control_id': 0}, {'name': 'Away', 'odds': '1.80', 'control_id': 1}"
+        )
+        seen = {}
+
+        async def fake_generate(*args, **kwargs):
+            seen["example"] = args[6] if len(args) > 6 else kwargs.get("example", "")
+            return complete
+
+        page = SimpleNamespace(evaluate=AsyncMock(return_value=page_data))
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "cache"
+            output = Path(directory) / "generated_scraper.py"
+            with patch("sports_odds_scraper.client.GENERATED", output), \
+                 patch("sports_odds_scraper.client.CACHE_DIR", cache), \
+                 patch("sports_odds_scraper.client.generate", side_effect=fake_generate), \
+                 patch("sports_odds_scraper.client.apply_prepare", new_callable=AsyncMock), \
+                 patch("sports_odds_scraper.client.confirm_live_updates", new_callable=AsyncMock, return_value=(True, "live feed")), \
+                 patch("sports_odds_scraper.client.audit_completeness", new_callable=AsyncMock, return_value=(True, "ok")):
+                save_scraper_example("https://www.williamhill.com/betting/en-gb/tennis", "match betting", previous)
+                self.assertEqual(load_scraper_example("https://williamhill.com/other", "match betting"), previous)
+                self.assertEqual(load_scraper_example("https://williamhill.com/other", "totals"), "")
+                await discover("test-key", "https://www.williamhill.com/betting/en-gb/tennis", "match betting", page, "gpt-6-luna", 1)
+                stored = example_cache_path("https://williamhill.com/betting/en-gb/tennis", "match betting").read_text()
+
+        self.assertEqual(seen["example"], previous)
+        self.assertEqual(stored, complete)
 
 
 class StatusAuditTests(unittest.IsolatedAsyncioTestCase):
@@ -233,6 +280,7 @@ def prepare_actions():
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "generated_scraper.py"
             with patch("sports_odds_scraper.client.GENERATED", output), \
+                 patch("sports_odds_scraper.client.CACHE_DIR", Path(directory) / "cache"), \
                  patch("sports_odds_scraper.client.generate", new_callable=AsyncMock, return_value=generated), \
                  patch("sports_odds_scraper.client.apply_prepare", new_callable=AsyncMock), \
                  patch("sports_odds_scraper.client.confirm_live_updates", new_callable=AsyncMock, return_value=(True, "live feed")), \

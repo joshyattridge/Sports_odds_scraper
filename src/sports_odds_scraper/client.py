@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Awaitable, Callable
 
 from playwright.async_api import Error as PlaywrightError, async_playwright
@@ -22,6 +23,7 @@ from .models import OddsEvent, OddsSnapshot, Selection
 from .status import CAPTURE_SCRIPT, parse_snapshot, with_status
 
 GENERATED = Path("generated_scraper.py")
+CACHE_DIR = Path.home() / ".cache" / "sports_odds_scraper"
 ALLOWED_IMPORTS = {"re", "json", "html", "decimal", "fractions", "typing", "dataclasses"}
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -183,10 +185,41 @@ PAGE AND DOM EVIDENCE:
     return True, "complete-page and observed-status audit passed"
 
 
-async def generate(api_key: str, url: str, market: str, snapshot: str, model: str, feedback: str = "") -> str:
+def example_cache_path(url: str, market: str) -> Path:
+    """Path for the last validated scraper for this site and market. Kept outside the repo."""
+    host = (urlparse(url).hostname or "unknown").lower().removeprefix("www.")
+    slug = re.sub(r"[^a-z0-9]+", "-", market.lower()).strip("-") or "market"
+    return CACHE_DIR / f"{host}__{slug}.py"
+
+
+def load_scraper_example(url: str, market: str) -> str:
+    """Return the stored scraper, including its status function, or an empty string."""
+    path = example_cache_path(url, market)
+    if not path.is_file():
+        return ""
+    return path.read_text()
+
+
+def save_scraper_example(url: str, market: str, code: str) -> None:
+    """Store a validated scraper so the next generation can follow it."""
+    path = example_cache_path(url, market)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(code)
+    logger.info("Stored scraper example for %s", path.name)
+
+
+async def generate(api_key: str, url: str, market: str, snapshot: str, model: str, feedback: str = "", example: str = "") -> str:
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(api_key=api_key)
+    example_block = ""
+    if example.strip():
+        example_block = (
+            "A previously validated scraper for this site and market is below. "
+            "The live page will not match it exactly. Follow its prepare_actions, "
+            "extract, and control_status approach, and adapt them to the current snapshot.\n\n"
+            f"PREVIOUSLY VALIDATED SCRAPER:\n{example}\n"
+        )
     prompt = f"""Write a complete Python scraper module for this URL and market.
 URL: {url}
 TARGET MARKET: {market}
@@ -249,7 +282,7 @@ Rules:
 - Return [] from extract when the requested market has no visible prices.
 
 {('PREVIOUS VALIDATION FEEDBACK: ' + feedback) if feedback else ''}
-
+{example_block}
 RENDERED SNAPSHOT AND CONTROL METADATA:
 {snapshot_for_prompt(snapshot)}
 
@@ -370,13 +403,16 @@ async def confirm_live_updates(page, seconds: float) -> tuple[bool, str]:
 async def discover(api_key: str, url: str, market: str, page, model: str, retries: int, stream_wait: float = 60.0) -> tuple[Path, object]:
     feedback = ""
     live = False
+    example = load_scraper_example(url, market)
+    if example:
+        logger.info("Including stored scraper example for %s (%s)", urlparse(url).hostname, market)
     for attempt in range(1, retries + 1):
         if attempt > 1 and not live:
             await page.reload(wait_until="domcontentloaded", timeout=45_000)
             await page.wait_for_timeout(3_000)
         snapshot = await capture_page(page)
         logger.info("Generating scraper with %s (attempt %d/%d)", model, attempt, retries)
-        code = await generate(api_key, url, market, snapshot, model, feedback)
+        code = await generate(api_key, url, market, snapshot, model, feedback, example)
         logger.info("%s returned generated scraper code (%d characters). Validating", model, len(code))
         ok, feedback = safe_code(code)
         if not ok:
@@ -400,6 +436,7 @@ async def discover(api_key: str, url: str, market: str, page, model: str, retrie
                 ok, audit_feedback = await audit_completeness(api_key, url, market, snapshot, rows, model, code)
                 if ok:
                     logger.info("Generated scraper validated on attempt %d: %s", attempt, audit_feedback)
+                    save_scraper_example(url, market, code)
                     return GENERATED, extract
                 feedback = audit_feedback
         except Exception as exc:

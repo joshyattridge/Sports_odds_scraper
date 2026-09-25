@@ -122,6 +122,11 @@ actions in the browser before trusting the page. They are how the scraper
 clears a site-specific blocker, such as accepting a cookie banner, so a live
 odds channel can start.
 
+After a scraper validates, its source is stored outside the repo at
+`~/.cache/sports_odds_scraper/`, one file per site and market. The next
+generation for that site includes the stored module in the prompt, including
+`control_status`. The model still writes a new scraper for the current page.
+
 During generation, validation watches the rendered odds for up to 60 seconds.
 It accepts the scraper when those prices change, whether the site pushes them
 over a websocket, polls for them, or uses another channel. A page that loads
