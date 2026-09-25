@@ -175,6 +175,78 @@ class MonitorBrowserTests(unittest.IsolatedAsyncioTestCase):
             await browser.close()
         self.assertTrue(ok, reason)
 
+    async def test_refresh_receives_odds_before_and_after_reload(self):
+        def prepare_actions():
+            return [{"action": "click", "role": "button", "name": "Accept all cookies"}]
+
+        extract.prepare_actions = prepare_actions
+        initial = """<!doctype html><body>
+            <button id="accept">Accept all cookies</button>
+            <section><h2>Game A</h2>
+                <button id="home">Home 2.10</button><button>Away 1.80</button>
+            </section>
+            <script>
+                document.getElementById('accept').onclick = () => {
+                    let tick = 0;
+                    setInterval(() => {
+                        tick += 1;
+                        const home = document.getElementById('home');
+                        if (home) home.textContent = 'Home ' + (2.10 + tick / 100).toFixed(2);
+                    }, 200);
+                };
+            </script>
+        </body>"""
+        refreshed = initial.replace(
+            "</section>",
+            "</section><section><h2>Game B</h2><button>Home 3.00</button><button>Away 1.40</button></section>",
+            1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            page_file = Path(directory) / "odds.html"
+            page_file.write_text(initial)
+            snapshots = asyncio.Queue()
+
+            async def discover_stub(api_key, url, market, browser_page, model, retries, stream_wait=60):
+                await apply_prepare(browser_page, prepare_actions())
+                return Path("unused"), extract
+
+            async def on_snapshot(snapshot):
+                if page_file.read_text() == initial:
+                    page_file.write_text(refreshed)
+                await snapshots.put(snapshot)
+
+            monitor = OddsMonitor(
+                page_file.as_uri(), "moneyline", "test-key", model="gpt-6-luna",
+                wait=0, poll_interval=0.5, refresh_interval=3,
+            )
+            with patch("sports_odds_scraper.client.discover", side_effect=discover_stub):
+                task = asyncio.create_task(monitor.run(on_snapshot=on_snapshot))
+                try:
+                    received = []
+                    deadline = asyncio.get_running_loop().time() + 12
+                    while asyncio.get_running_loop().time() < deadline:
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        try:
+                            received.append(await asyncio.wait_for(snapshots.get(), remaining))
+                        except asyncio.TimeoutError:
+                            break
+                finally:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+        before = [snapshot for snapshot in received if [event.event for event in snapshot.events] == ["Game A"]]
+        after = [snapshot for snapshot in received if any(event.event == "Game B" for event in snapshot.events)]
+        self.assertTrue(before, "expected odds before the refresh")
+        self.assertTrue(any(snapshot.events[0].selections[0].odds > 2.10 for snapshot in before))
+        self.assertTrue(after, "expected the new event after the refresh")
+        self.assertTrue(any(
+            event.selections[0].odds > 2.10
+            for snapshot in after for event in snapshot.events if event.event == "Game A"
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()

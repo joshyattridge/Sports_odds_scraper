@@ -133,7 +133,10 @@ over a websocket, polls for them, or uses another channel. A page that loads
 one snapshot and then sits still is rejected, and the model is asked to
 unblock the updates. Once those prices are moving, a later attempt keeps that
 page and only regenerates the extractor. Reloading is reserved for a page
-whose odds never started updating. A separate audit then checks the prices, the control
+whose odds never started updating. After monitoring has started, the page
+reloads every 5 minutes so a match that begins later can appear. The generated
+prepare actions run again, and monitoring continues once the odds are moving
+on the reloaded page. A separate audit then checks the prices, the control
 mappings, and **at least one real selection for each enabled or disabled state
 that page actually shows**. A state that never appears is left out of the
 verified set and reported that way in the logs. When the page's availability

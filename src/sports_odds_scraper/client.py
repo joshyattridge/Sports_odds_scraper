@@ -354,7 +354,7 @@ def _prepare_locator(page, action: dict):
     raise RuntimeError("click action needs selector, role and name, or text")
 
 
-async def apply_prepare(page, actions) -> None:
+async def apply_prepare(page, actions, *, required: bool = True) -> None:
     """Run the generated actions that unblock a live odds stream."""
     if not isinstance(actions, list) or len(actions) > 8:
         raise RuntimeError("prepare_actions() must return a list of at most 8 actions")
@@ -365,6 +365,9 @@ async def apply_prepare(page, actions) -> None:
         if kind == "click":
             locator = _prepare_locator(page, action)
             if await locator.count() == 0:
+                if not required:
+                    logger.info("Prepare click %d skipped, nothing to click: %s", index, action)
+                    continue
                 raise RuntimeError(f"prepare click {index} matched no element: {action}")
             await locator.first.click(timeout=5_000)
             logger.info("Prepare action %d clicked %s", index, action)
@@ -518,6 +521,69 @@ class SnapshotProcessor:
         self.last_changed = last_changed
 
 
+async def install_observer(page) -> None:
+    """Watch the current document. A reload drops the previous observer."""
+    await page.evaluate("""() => {
+        window.__capture_odds_snapshot = (""" + CAPTURE_SCRIPT + """);
+    }""")
+    await page.evaluate("""
+        () => {
+            if (window.__odds_observer) window.__odds_observer.disconnect();
+            let timer = null;
+            const notify = () => {
+                clearTimeout(timer);
+                timer = setTimeout(() => {
+                    window.odds_changed(JSON.stringify(window.__capture_odds_snapshot()));
+                }, 250);
+            };
+            window.__odds_observer = new MutationObserver(notify);
+            window.__odds_observer.observe(document.body, {
+                subtree: true,
+                childList: true,
+                characterData: true,
+                attributes: true,
+            });
+        }
+    """)
+
+
+async def refresh_for_new_events(page, prepare) -> None:
+    """Reload so new events can appear, then resume the live odds."""
+    logger.info("Refreshing the page for new events")
+    await page.reload(wait_until="domcontentloaded", timeout=45_000)
+    await page.wait_for_timeout(3_000)
+    await install_observer(page)
+    actions = []
+    if callable(prepare):
+        try:
+            actions = prepare() or []
+        except Exception as exc:
+            logger.warning("prepare_actions failed after refresh: %s", exc)
+    if actions:
+        await apply_prepare(page, actions, required=False)
+    ok, reason = await confirm_live_updates(page, 8)
+    if not ok:
+        logger.info("Clicking the page to resume live odds after refresh")
+        await page.locator("body").click(position={"x": 30, "y": 30}, timeout=5_000)
+        ok, reason = await confirm_live_updates(page, 15)
+    if ok:
+        logger.info("Odds resumed after refresh: %s", reason)
+    else:
+        logger.warning("Odds did not resume after refresh: %s", reason)
+
+
+async def refresh_loop(page, prepare, interval: float) -> None:
+    """Reload on a fixed interval so events that start later can appear."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await refresh_for_new_events(page, prepare)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Page refresh failed: %s", exc)
+
+
 async def poll_snapshots(page, processor: SnapshotProcessor, interval: float) -> None:
     """Check the rendered page periodically in case a DOM notification was missed."""
     while True:
@@ -541,6 +607,7 @@ async def run(
     odds_format: str = "decimal",
     poll_interval: float = 1.0,
     stream_wait: float = 60.0,
+    refresh_interval: float = 300.0,
 ) -> None:
     if not api_key:
         raise ValueError("api_key is required")
@@ -553,6 +620,8 @@ async def run(
         raise ValueError("poll_interval must be greater than 0")
     if stream_wait <= 0:
         raise ValueError("stream_wait must be greater than 0")
+    if refresh_interval <= 0:
+        raise ValueError("refresh_interval must be greater than 0")
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
         page = await browser.new_page(
@@ -571,31 +640,18 @@ async def run(
                 "odds_changed",
                 lambda source, body: processor.process(body),
             )
-            await page.evaluate("""() => {
-                window.__capture_odds_snapshot = (""" + CAPTURE_SCRIPT + """);
-            }""")
-            await page.evaluate("""
-                () => {
-                    let timer = null;
-                    const notify = () => {
-                        clearTimeout(timer);
-                        timer = setTimeout(() => {
-                            window.odds_changed(JSON.stringify(window.__capture_odds_snapshot()));
-                        }, 250);
-                    };
-                    window.__odds_observer = new MutationObserver(notify);
-                    window.__odds_observer.observe(document.body, {
-                        subtree: true,
-                        childList: true,
-                        characterData: true,
-                        attributes: true,
-                    });
-                    window.__odds_observer_installed = true;
-                }
-            """)
+            await install_observer(page)
             processor.process(await capture_page(page))
-            logger.info("Watching for live page changes (DOM observer + %.1fs poll)", poll_interval)
-            await poll_snapshots(page, processor, poll_interval)
+            logger.info("Watching for live page changes (DOM observer + %.1fs poll, refresh every %.0fs)", poll_interval, refresh_interval)
+            refresh_task = asyncio.create_task(refresh_loop(page, getattr(extract, "prepare_actions", None), refresh_interval))
+            try:
+                await poll_snapshots(page, processor, poll_interval)
+            finally:
+                refresh_task.cancel()
+                try:
+                    await refresh_task
+                except asyncio.CancelledError:
+                    pass
         finally:
             if processor is not None:
                 await processor.close()
@@ -612,7 +668,7 @@ class OddsMonitor:
         model: Model used for scraper generation and auditing, such as ``gpt-6-luna``.
     """
 
-    def __init__(self, url: str, market: str, api_key: str, *, model: str, odds_format: str = "decimal", retries: int = 5, wait: float = 30.0, poll_interval: float = 1.0, stream_wait: float = 60.0):
+    def __init__(self, url: str, market: str, api_key: str, *, model: str, odds_format: str = "decimal", retries: int = 5, wait: float = 30.0, poll_interval: float = 1.0, stream_wait: float = 60.0, refresh_interval: float = 300.0):
         if not api_key:
             raise ValueError("api_key is required")
         if not model or not str(model).strip():
@@ -627,12 +683,15 @@ class OddsMonitor:
             raise ValueError("poll_interval must be greater than 0")
         if stream_wait <= 0:
             raise ValueError("stream_wait must be greater than 0")
+        if refresh_interval <= 0:
+            raise ValueError("refresh_interval must be greater than 0")
         self.odds_format = odds_format
         self.retries = retries
         self.wait = wait
         self.poll_interval = poll_interval
         self.stream_wait = stream_wait
+        self.refresh_interval = refresh_interval
 
     async def run(self, on_snapshot: Callable[[OddsSnapshot], Awaitable[None]]) -> None:
         """Start monitoring and deliver full snapshots when odds change."""
-        return await run(self.api_key, self.url, self.market, on_snapshot, self.model, self.retries, self.wait, self.odds_format, self.poll_interval, self.stream_wait)
+        return await run(self.api_key, self.url, self.market, on_snapshot, self.model, self.retries, self.wait, self.odds_format, self.poll_interval, self.stream_wait, self.refresh_interval)
